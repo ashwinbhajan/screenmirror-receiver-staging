@@ -1,0 +1,1678 @@
+(function receiverCapabilityGate(global) {
+  "use strict";
+
+  const RECEIVER_VERSION = "2.0.0";
+  const RECEIVER_REVISION = "connected-state-idle-return-20261103-01";
+  // After this many ms with no active cast (sitting on "Casting Stopped" or
+  // "Connection Lost"), release the Cast session so the TV returns to its
+  // own home screen instead of sitting on an idle Screen Mirror page
+  // indefinitely. Does not apply to "Ready to Cast" (first launch, still
+  // mid-setup) or "Reconnecting" (an in-progress recovery) — only after a
+  // cast has actually stopped or dropped.
+  const IDLE_RETURN_TO_HOME_MS = 90000;
+  const PROTOCOL_VERSION = 2;
+  const NAMESPACE = "urn:x-cast:com.ashwinbhajan.screenmirror.cmafprobe.v2";
+  const MIME_TYPE = 'video/mp4; codecs="avc1.42e01f"';
+  const AUDIO_MIME_TYPE = 'audio/mp4; codecs="mp4a.40.2"';
+  const MAX_MESSAGE_BYTES = 1024;
+  const RETAINED_HISTORY_SECONDS = 2.5;
+  const TRIM_HISTORY_THRESHOLD_SECONDS = 4;
+  const LIVE_EDGE_FAST_THRESHOLD_SECONDS = 1.25;
+  const LIVE_EDGE_NORMAL_THRESHOLD_SECONDS = 0.75;
+  const LIVE_EDGE_FAST_PLAYBACK_RATE = 1.2;
+  const HEALTHY_CATCHUP_TRIGGER_SECONDS = 6;
+  const HEALTHY_CATCHUP_REARM_SECONDS = 3;
+  const HEALTHY_CATCHUP_MARGIN_SECONDS = 1;
+  const HEALTHY_CATCHUP_MIN_JUMP_SECONDS = 2;
+  const HEALTHY_CATCHUP_PERSIST_MS = 2500;
+  const HEALTHY_CATCHUP_COOLDOWN_MS = 10000;
+  const REQUEST_ID = /^[A-Za-z0-9._-]{1,64}$/;
+  const RESULT = Object.freeze({
+    PASS: "capability_pass",
+    PARTIAL: "capability_partial",
+    FAILED: "capability_failed",
+    MIXED_CONTENT_BLOCKED: "websocket_mixed_content_blocked",
+    WEBSOCKET_FAILED: "websocket_failed"
+  });
+
+  const startupTiming = Object.create(null);
+  const senderConnections = new Map();
+  let activeReceiverPagehideListener = null;
+  let activeMediaRun = 0;
+  const receiverNow = () => global.performance && typeof global.performance.now === "function" ? global.performance.now() : null;
+  startupTiming.receiver_page_script_started = Number.isFinite(global.__screenMirrorPageScriptStarted)
+    ? global.__screenMirrorPageScriptStarted : receiverNow();
+  function recordReceiverStartup(name, at = receiverNow()) {
+    if (Number.isFinite(at) && startupTiming[name] === undefined) startupTiming[name] = at;
+  }
+  function emitReceiverStartup(event, request) {
+    for (const name of ["receiver_page_script_started", "receiver_caf_context_ready", "receiver_namespace_registered"]) {
+      if (Number.isFinite(startupTiming[name])) {
+        try { sendMediaResult(event.senderId, request.requestId, name, undefined, startupTiming[name]); } catch (_) {}
+      }
+    }
+    const connectedAt = senderConnections.get(event.senderId);
+    if (Number.isFinite(connectedAt)) {
+      try { sendMediaResult(event.senderId, request.requestId, "receiver_sender_connected", undefined, connectedAt); } catch (_) {}
+    }
+  }
+
+  let context;
+  let ui;
+  // "lost" means the TV is showing "Connection Lost / Waiting for iPhone" — it IS ready for a
+  // new sender to reconnect. Only "playing" (someone actively mirroring) blocks a new session.
+  const receiverReadinessStateForScreen = (screen) => screen === "playing" ? "mirroring" : "ready";
+  let receiverReadinessState = "ready";
+  let capabilities = Object.freeze({ webSocketAPI: false, mediaSource: false, avcMIME: false, sourceBuffer: false, autoplay: "deferred", websocketAttempted: false, websocketAuthenticated: false, probeAckStatus: "not_attempted", terminalStatus: "capability_partial", websocketLifecycle: "not_attempted" });
+  let capabilityProbe = Object.freeze({ avcMIMEOutcome: "not_tested", avcMIMEException: "none", sourceBufferOutcome: "not_tested", sourceBufferException: "none" });
+  const capabilityProbeTrace = { settled: "not_started", sourceOpen: "not_seen", addSourceBuffer: "not_attempted", sourceStateAtTimeout: "na", source: null, sourceOpenDelayMs: -1 };
+  let capabilityReadyPromise = Promise.resolve(capabilities);
+
+  function byteLength(value) { return new TextEncoder().encode(value).length; }
+  function safeObject(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
+  const SCREEN_COPY = Object.freeze({
+    ready: Object.freeze(["Ready to Cast", "Open the app on your iPhone to begin."]),
+    connected: Object.freeze(["Connected", "Starting your cast…"]),
+    stopped: Object.freeze(["Casting Stopped", "Ready when you are. Start casting again from your iPhone."]),
+    lost: Object.freeze(["Connection Lost", "We’re waiting for your iPhone. Check Wi‑Fi and start casting again."]),
+    reconnecting: Object.freeze(["Reconnecting…", "Keep the app open on your iPhone."])
+  });
+  // Only "stopped" and "lost" count as genuinely idle for the return-to-home
+  // timer — "ready" is first launch (still mid-setup) and "reconnecting" is
+  // an in-progress recovery, neither of which should be cut short.
+  const IDLE_RETURN_TO_HOME_STATES = Object.freeze(["stopped", "lost"]);
+  let idleReturnToHomeTimer = null;
+  function cancelIdleReturnToHomeTimer() {
+    if (idleReturnToHomeTimer === null) return;
+    global.clearTimeout(idleReturnToHomeTimer);
+    idleReturnToHomeTimer = null;
+  }
+  function scheduleIdleReturnToHomeTimer() {
+    cancelIdleReturnToHomeTimer();
+    idleReturnToHomeTimer = global.setTimeout(() => {
+      idleReturnToHomeTimer = null;
+      try {
+        if (context && typeof context.stop === "function") context.stop();
+      } catch (_) {}
+    }, IDLE_RETURN_TO_HOME_MS);
+  }
+  function showScreen(state) {
+    receiverReadinessState = receiverReadinessStateForScreen(state);
+    if (IDLE_RETURN_TO_HOME_STATES.includes(state)) scheduleIdleReturnToHomeTimer();
+    else cancelIdleReturnToHomeTimer();
+    if (!ui) return;
+    const copy = SCREEN_COPY[state];
+    ui.panel.hidden = state === "playing";
+    document.body.classList.remove("receiver-waiting");
+    if (state === "ready" || state === "reconnecting") document.body.classList.add("receiver-waiting");
+    if (copy) { ui.title.textContent = copy[0]; ui.detail.textContent = copy[1]; }
+  }
+  function closeScreen(event, failed) {
+    return !failed && event && event.code === 1000 && event.wasClean === true ? "stopped" : "lost";
+  }
+  function parse(data) {
+    try {
+      const raw = typeof data === "string" ? data : JSON.stringify(data);
+      if (!raw || byteLength(raw) > MAX_MESSAGE_BYTES) return null;
+      const object = JSON.parse(raw);
+      return safeObject(object) ? object : null;
+    } catch (_) { return null; }
+  }
+  function makeResult(requestId, result) {
+    return { type: "probeResult", protocolVersion: PROTOCOL_VERSION, requestId, receiverVersion: RECEIVER_VERSION, result, capabilities: { ...capabilities } };
+  }
+  function validEndpoint(value) {
+    try {
+      const url = new URL(value);
+      return url.protocol === "ws:" && !!url.hostname && !!url.port && /^\/[A-Za-z0-9]{64}$/.test(url.pathname);
+    } catch (_) { return false; }
+  }
+  function validateProbe(data) {
+    const message = parse(data);
+    if (!message || Object.keys(message).length !== 4 || message.type !== "probeEndpoint" ||
+        message.protocolVersion !== PROTOCOL_VERSION || typeof message.requestId !== "string" ||
+        !REQUEST_ID.test(message.requestId) || typeof message.endpoint !== "string" || !validEndpoint(message.endpoint)) return null;
+    return message;
+  }
+  function validateReadyQuery(data) {
+    const message = parse(data);
+    if (!message || Object.keys(message).length !== 3 || message.type !== "receiverReadyQuery" ||
+        message.protocolVersion !== PROTOCOL_VERSION || typeof message.requestId !== "string" ||
+        !REQUEST_ID.test(message.requestId)) return null;
+    return message;
+  }
+  function makeReadyReport(requestId, receiverState = receiverReadinessState, audioSupported = false) {
+    const report = { type: "receiverReadyReport", protocolVersion: PROTOCOL_VERSION, requestId,
+      receiverVersion: RECEIVER_VERSION, receiverRevision: RECEIVER_REVISION, receiverState };
+    if (audioSupported) report.audioCapabilities = ["aac_lc_cmaf"];
+    return report;
+  }
+  // Visibility (opt-in, 2026-11-24). A receiver kept running behind another
+  // TV app (e.g. YouTube) still answers Ready and accepts media while nothing
+  // is visible. Senders that understand this ask with a separate query and
+  // are then told about changes; older senders never ask and never receive
+  // these messages, so the existing Ready report is unchanged.
+  function validateVisibilityQuery(data) {
+    const message = parse(data);
+    if (!message || Object.keys(message).length !== 3 || message.type !== "receiverVisibilityQuery" ||
+        message.protocolVersion !== PROTOCOL_VERSION || typeof message.requestId !== "string" ||
+        !REQUEST_ID.test(message.requestId)) return null;
+    return message;
+  }
+  function resolveVisibility(documentState, cafVisibility, cafStandby) {
+    if (documentState === "hidden" || cafVisibility === "NOT_VISIBLE" || cafStandby === "STANDBY") return "hidden";
+    if (documentState === "visible" || cafVisibility === "VISIBLE") return "visible";
+    return "unknown";
+  }
+  function makeVisibilityReport(requestId, visibility) {
+    return { type: "receiverVisibilityReport", protocolVersion: PROTOCOL_VERSION, requestId, visibility };
+  }
+  function capabilityResult() {
+    return capabilities.webSocketAPI && capabilities.mediaSource && capabilities.avcMIME && capabilities.sourceBuffer;
+  }
+  function safeException(error) {
+    if (!error) return "none";
+    const name = typeof error.name === "string" ? error.name : "error";
+    const message = typeof error.message === "string" ? error.message : "";
+    return `${name}_${message}`.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "").slice(0, 64) || "error";
+  }
+  function safeMediaSourceState(source) {
+    try { return source && ["closed", "open", "ended"].includes(source.readyState) ? source.readyState : "unknown"; }
+    catch (_) { return "unknown"; }
+  }
+  function capabilityDiagnosticResults() {
+    const bool = (value) => value ? "true" : "false";
+    const openDelay = capabilityProbeTrace.sourceOpenDelayMs < 0 ? "na" : capabilityProbeTrace.sourceOpenDelayMs;
+    const results = [
+      `receiver_capability_websocket_${bool(capabilities.webSocketAPI)}_mediasource_${bool(capabilities.mediaSource)}_avcmime_${bool(capabilities.avcMIME)}_sourcebuffer_${bool(capabilities.sourceBuffer)}`,
+      "receiver_capability_probe_protocol_2_mime_avc1_42e01f",
+      `receiver_capability_avcmime_outcome_${capabilityProbe.avcMIMEOutcome}_exception_${capabilityProbe.avcMIMEException}`,
+      `receiver_capability_sourcebuffer_outcome_${capabilityProbe.sourceBufferOutcome}_exception_${capabilityProbe.sourceBufferException}`
+    ];
+    if (capabilityProbeTrace.settled !== "not_started") results.push(
+      `receiver_capability_probe_settled_${capabilityProbeTrace.settled}_sourceopen_${capabilityProbeTrace.sourceOpen}`,
+      `receiver_capability_probe_addbuffer_${capabilityProbeTrace.addSourceBuffer}_open_delay_ms_${openDelay}`,
+      `receiver_capability_probe_source_state_timeout_${capabilityProbeTrace.sourceStateAtTimeout}_at_media_${safeMediaSourceState(capabilityProbeTrace.source)}`
+    );
+    results.push("receiver_capability_revision_corr_fragseq_20260922_capability_snapshot");
+    return results;
+  }
+  function sendCapabilityDiagnostics(event, request) {
+    for (const result of capabilityDiagnosticResults()) sendMediaResult(event.senderId, request.requestId, result);
+  }
+  function recoverySeekTarget(currentTime, start, end) {
+    if (!Number.isFinite(currentTime) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+    const inset = Math.min(0.05, Math.max(0, (end - start) / 2));
+    if (currentTime < start) return start + inset;
+    if (currentTime > end) return end - inset;
+    return null;
+  }
+  function stalledLiveEdgeSeekTarget(currentTime, start, end) {
+    if (!Number.isFinite(currentTime) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start || end - currentTime < 0.05) return null;
+    const target = Math.max(start + 0.05, end - 0.05);
+    return target > currentTime + 0.02 ? target : null;
+  }
+  function bufferedTrimEnd(currentTime, start, end) {
+    if (!Number.isFinite(currentTime) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+    if (currentTime - start <= TRIM_HISTORY_THRESHOLD_SECONDS || end - currentTime < 0.5) return null;
+    return Math.max(0, currentTime - RETAINED_HISTORY_SECONDS);
+  }
+  function liveEdgePlaybackRate(lead, currentRate) {
+    if (!Number.isFinite(lead) || !Number.isFinite(currentRate)) return null;
+    if (lead >= LIVE_EDGE_FAST_THRESHOLD_SECONDS) return LIVE_EDGE_FAST_PLAYBACK_RATE;
+    if (currentRate > 1 && lead <= LIVE_EDGE_NORMAL_THRESHOLD_SECONDS) return 1;
+    return null;
+  }
+  function readBufferedRanges(ranges) {
+    const result = [];
+    try {
+      for (let i = 0; ranges && i < Math.min(ranges.length, 8); i += 1) {
+        const start = ranges.start(i); const end = ranges.end(i);
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return [];
+        result.push({ start, end });
+      }
+    } catch (_) { return []; }
+    return result;
+  }
+  function containingRange(ranges, position) {
+    if (!Number.isFinite(position)) return null;
+    return ranges.find((range) => range.start <= position && position < range.end) || null;
+  }
+  // An appended sync sample, rather than an arbitrary buffered time, is the
+  // only eligible healthy catch-up destination. The same media element seeks
+  // both tracks; AAC additionally requires one continuous common range.
+  function createHealthyLiveEdgeCatchup(runID) {
+    let highSince = null; let lastSeekAt = -Infinity; let armed = true; let seekPending = false; let closed = false;
+    return {
+      consider(sample) {
+        if (closed || sample.runID !== runID) return null;
+        const now = sample.nowMs;
+        const videoRange = containingRange(sample.videoRanges || [], sample.currentTime);
+        const audioRange = sample.audioRequested ? containingRange(sample.audioRanges || [], sample.currentTime) : null;
+        const healthy = Number.isFinite(now) && videoRange && sample.readyState >= 3 && !sample.paused
+          && !sample.ended && !sample.seeking && !sample.mediaError && sample.sourceOpen
+          && !sample.videoUpdating && sample.pendingDepth <= 1 && sample.progressAgeMs <= 750
+          && sample.appendAgeMs <= 1000 && (sample.renderAgeMs === null || sample.renderAgeMs <= 750)
+          && (!sample.audioRequested || (sample.audioReady && audioRange && !sample.audioUpdating));
+        if (!healthy) { highSince = null; return null; }
+        const end = sample.audioRequested ? Math.min(videoRange.end, audioRange.end) : videoRange.end;
+        const lead = end - sample.currentTime;
+        if (lead <= HEALTHY_CATCHUP_REARM_SECONDS && !seekPending) armed = true;
+        if (lead < HEALTHY_CATCHUP_TRIGGER_SECONDS || !armed || seekPending) { highSince = null; return null; }
+        if (highSince === null) highSince = now;
+        if (now - highSince < HEALTHY_CATCHUP_PERSIST_MS || now - lastSeekAt < HEALTHY_CATCHUP_COOLDOWN_MS) return null;
+        const latest = end - HEALTHY_CATCHUP_MARGIN_SECONDS;
+        const candidates = (sample.syncPoints || []).filter((point) => Number.isFinite(point)
+          && point >= videoRange.start && point < videoRange.end
+          && (!sample.audioRequested || (point >= audioRange.start && point < audioRange.end))
+          && point <= latest && point - sample.currentTime >= HEALTHY_CATCHUP_MIN_JUMP_SECONDS);
+        const sync = candidates[candidates.length - 1];
+        if (sync === undefined) return null;
+        highSince = null; armed = false; seekPending = true; lastSeekAt = now;
+        return sync;
+      },
+      completeSeek(run) { if (!closed && run === runID) seekPending = false; },
+      close() { closed = true; highSince = null; seekPending = false; }
+    };
+  }
+  function makeLatencyStage(generation, sequence, stage, receiverTimeMs, bufferLeadMs, pendingDepth) {
+    if (!Number.isInteger(generation) || generation <= 0 || !Number.isInteger(sequence) || sequence <= 0 ||
+        !["received", "append_started", "append_ended"].includes(stage) || !Number.isFinite(receiverTimeMs) || receiverTimeMs < 0 ||
+        !Number.isFinite(bufferLeadMs) || bufferLeadMs < 0 || !Number.isInteger(pendingDepth) || pendingDepth < 0 || pendingDepth > 8) return null;
+    return { type: "latencyStage", generation, sequence, stage, receiverTimeMs, bufferLeadMs, pendingDepth };
+  }
+  function makePeriodicPlaybackSample(video, buffer, metrics) {
+    const boundedMs = (seconds) => Number.isFinite(seconds) && seconds >= 0 ? Math.min(3600000, Math.round(seconds * 1000)) : -1;
+    const endMs = (ranges) => {
+      try { return ranges && ranges.length ? boundedMs(ranges.end(ranges.length - 1)) : -1; }
+      catch (_) { return -1; }
+    };
+    let quality;
+    try { quality = typeof video.getVideoPlaybackQuality === "function" ? video.getVideoPlaybackQuality() : null; } catch (_) { quality = null; }
+    const count = (value) => Number.isFinite(value) && value >= 0 ? Math.min(1000000, Math.floor(value)) : -1;
+    const currentTimeMs = boundedMs(video.currentTime);
+    const sourceEndMs = endMs(buffer && buffer.buffered);
+    return {
+      type: "stats", protocolVersion: PROTOCOL_VERSION, generation: metrics.generation,
+      sampleIndex: metrics.sampleIndex, receiverTimeMs: Math.max(0, Math.round(metrics.nowMs)),
+      currentTimeMs, bufferedEndMs: endMs(video.buffered), sourceEndMs,
+      liveEdgeMs: sourceEndMs < 0 || currentTimeMs < 0 ? -1 : Math.max(-60000, Math.min(60000, sourceEndMs - currentTimeMs)),
+      readyState: Math.max(0, Math.min(4, video.readyState || 0)), paused: !!video.paused,
+      playbackRateMilli: Math.max(0, Math.min(4000, Math.round((video.playbackRate || 0) * 1000))),
+      sourceUpdating: !!(buffer && buffer.updating), queueDepth: Math.max(0, Math.min(8, metrics.queueDepth)),
+      receiverDrops: count(metrics.receiverDrops), appendedFragments: count(metrics.appendedFragments),
+      renderedCallbacks: count(metrics.renderedCallbacks), presentedFrames: count(metrics.presentedFrames),
+      totalVideoFrames: count(quality && quality.totalVideoFrames), droppedFrames: count(quality && quality.droppedVideoFrames),
+      uncorrelatedFrames: count(metrics.uncorrelatedFrames),
+      lastAppendAgeMs: metrics.lastAppendAtMs === null ? -1 : Math.max(0, Math.min(60000, Math.round(metrics.nowMs - metrics.lastAppendAtMs))),
+      lastRenderAgeMs: metrics.lastRenderAtMs === null ? -1 : Math.max(0, Math.min(60000, Math.round(metrics.nowMs - metrics.lastRenderAtMs))),
+      renderedMediaTimeMs: boundedMs(metrics.renderedMediaTime),
+      decodeDurationMs: Math.min(60000, boundedMs(metrics.decodeDuration)),
+      displayLeadMs: Math.min(60000, boundedMs(metrics.displayLead)),
+      seekCount: count(metrics.seekCount), lastSeekKind: metrics.lastSeekKind,
+      rateChanges: count(metrics.rateChanges)
+    };
+  }
+  function canConfirmFirstRendered(firstRendered, firstMediaAppended, metadata) {
+    return !firstRendered && firstMediaAppended && Number.isFinite(metadata && metadata.presentedFrames) && metadata.presentedFrames > 0;
+  }
+  // Presentation-only gate. `waiting` is commonly emitted around a normal MSE
+  // append; it must not replace visible video with the casting screen unless
+  // playback has genuinely stopped advancing for the existing stall interval.
+  function shouldShowReconnectingScreen(firstRendered, receiverStopped, playbackAdvancedAt, now, stallThresholdMs) {
+    return !!firstRendered && !receiverStopped && Number.isFinite(playbackAdvancedAt) && Number.isFinite(now) && Number.isFinite(stallThresholdMs) && now - playbackAdvancedAt >= stallThresholdMs;
+  }
+  function renderedCorrelationStrategy(hasExactMatch, hasOrderedMatch) {
+    if (hasExactMatch) return "media_time";
+    if (hasOrderedMatch) return "append_order";
+    return "unavailable";
+  }
+  // Diagnostic state only: no media payloads, credits, or queue ownership.
+  function createFrameCorrelationTracker(generation, diagnostic, stage, rendered) {
+    const fragments = []; const controls = new Map(); const callbacks = [];
+    const maxFragments = 64; const maxCallbacks = 256; const ttlMs = 10000; const mediaToleranceSeconds = 0.5;
+    const counts = {}; let closed = false;
+    const emit = (reason) => { counts[reason] = (counts[reason] || 0) + 1; if (counts[reason] <= 8) diagnostic(reason); };
+    let comparisonDiagnostics = 0;
+    const fail = () => emit("rendered_frame_uncorrelated_no_fragment_match");
+    const nearestFragment = (mediaTime, candidates) => candidates.reduce((best, item) => {
+      const delta = Math.abs(item.mediaTime - mediaTime);
+      return !best || delta < best.delta ? { item, delta } : best;
+    }, null);
+    const emitComparison = (prefix, control, candidate, retained) => {
+      if (comparisonDiagnostics >= 8) return;
+      comparisonDiagnostics += 1;
+      const nearest = candidate ? candidate.item : null;
+      diagnostic(`${prefix}_controlSeq_${Number.isInteger(control.sequence) ? control.sequence : "na"}_controlFragmentSeq_${Number.isInteger(control.fragmentSequence) ? control.fragmentSequence : "na"}_controlMediaMs_${Math.round(control.mediaTime * 1000)}_controlCapturePTS90k_${Number.isInteger(control.capturePTS90k) ? control.capturePTS90k : "na"}_controlCaptureDelta90k_${Number.isInteger(control.captureDelta90k) ? control.captureDelta90k : "na"}_nearestFragmentSeq_${nearest ? nearest.id : "na"}_nearestMediaMs_${nearest ? Math.round(nearest.mediaTime * 1000) : "na"}_deltaMs_${candidate ? Math.round(candidate.delta * 1000) : "na"}_generationMatch_${control.generation === generation ? 1 : 0}_retained_${retained}_appended_${nearest && nearest.appendedAt !== undefined ? 1 : 0}`);
+    };
+    const expire = (now) => {
+      while (fragments.length && (now - fragments[0].receivedAt >= ttlMs || fragments.length > maxFragments)) {
+        const item = fragments.shift();
+        if (!item.correlation) emit("frame_correlation_late_bind_expired");
+      }
+      for (const [key, item] of controls) if (now - item.at >= ttlMs) controls.delete(key);
+      while (callbacks.length && (now - callbacks[0].now >= ttlMs || callbacks.length > maxCallbacks)) { callbacks.shift(); fail(); }
+    };
+    const bind = (item, control) => {
+      item.correlation = control;
+      controls.delete(control.sequence);
+      if (item.appendedAt !== undefined) emit("frame_correlation_late_bound");
+      for (const [name, at] of [["received", item.receivedAt], ["append_started", item.startedAt], ["append_ended", item.appendedAt]]) {
+        if (at !== undefined) stage(name, control.sequence, at, item.metrics[name]);
+      }
+    };
+    const match = (frame) => {
+      const appended = fragments.filter((item) => item.appendedAt !== undefined && item.appendedAt <= frame.now);
+      // Match the actual fragment's decode-time interval before using ordered fallback.
+      const exact = appended.find((item, index) => item.correlation &&
+        frame.metadata.mediaTime >= item.mediaTime - 0.001 &&
+        frame.metadata.mediaTime < (appended[index + 1] ? appended[index + 1].mediaTime : item.mediaTime + mediaToleranceSeconds));
+      let item = exact;
+      if (item && item.sent) return true;
+      if (!item) {
+        const nearest = nearestFragment(frame.metadata.mediaTime, appended.filter((candidate) => candidate.correlation && !candidate.sent));
+        if (nearest && nearest.delta <= mediaToleranceSeconds) item = nearest.item;
+      }
+      // If the callback's media time is outside the retained range, use the
+      // oldest appended correlated fragment as the bounded ordered fallback.
+      // This is valid only when an exact control binding already exists.
+      const unresolvedOlderFragment = appended.some((candidate) => !candidate.correlation && !candidate.sent && candidate.mediaTime <= frame.metadata.mediaTime);
+      if (!item && !unresolvedOlderFragment) {
+        item = appended.find((candidate) => candidate.correlation && !candidate.sent);
+      }
+      if (!item && !unresolvedOlderFragment) emitComparison("frame_correlation_render_no_match", { generation, mediaTime: frame.metadata.mediaTime }, nearestFragment(frame.metadata.mediaTime, appended), fragments.length);
+      if (!item || !item.correlation) return false;
+      if (!item.sent) { item.sent = true; rendered(frame.now, frame.metadata, item.correlation); }
+      return true;
+    };
+    const retry = () => { for (let i = 0; i < callbacks.length;) { if (match(callbacks[i])) callbacks.splice(i, 1); else i += 1; } };
+    return {
+      receive(id, mediaTime, now, metrics) {
+        if (closed) return null;
+        expire(now);
+        const item = { id, mediaTime, receivedAt: now, metrics: { received: metrics } };
+        fragments.push(item); expire(now);
+        const controlByFragmentID = Array.from(controls.values()).find((control) => control.fragmentSequence === id) || controls.get(id);
+        const candidate = controlByFragmentID
+          ? { item: controlByFragmentID, delta: Math.abs(controlByFragmentID.mediaTime - mediaTime) }
+          : nearestFragment(mediaTime, Array.from(controls.values()));
+        const control = candidate && candidate.delta <= mediaToleranceSeconds ? candidate.item : null;
+        if (controlByFragmentID || control) bind(item, controlByFragmentID || control);
+        return item;
+      },
+      start(item, now, metrics) { if (!item || closed) return; item.startedAt = now; item.metrics.append_started = metrics; if (item.correlation) stage("append_started", item.correlation.sequence, now, metrics); },
+      append(item, now, metrics) { if (!item || closed) return; item.appendedAt = now; item.metrics.append_ended = metrics; if (item.correlation) stage("append_ended", item.correlation.sequence, now, metrics); expire(now); retry(); },
+      control(value, now) {
+        if (closed || value.generation !== generation || value.sequence <= 0 || !Number.isFinite(value.mediaTimeMs)) return;
+        expire(now);
+        const control = { generation, sequence: value.sequence, fragmentSequence: Number.isInteger(value.fragmentSequence) ? value.fragmentSequence : null, mediaTime: value.mediaTimeMs / 1000, capturePTS90k: Number.isInteger(value.capturePTS90k) ? value.capturePTS90k : null, captureDelta90k: Number.isInteger(value.captureDelta90k) ? value.captureDelta90k : null, at: now };
+        const fragmentByID = fragments.find((item) => !item.correlation && item.id === (control.fragmentSequence || control.sequence));
+        const candidate = fragmentByID
+          ? { item: fragmentByID, delta: Math.abs(fragmentByID.mediaTime - control.mediaTime) }
+          : nearestFragment(control.mediaTime, fragments.filter((item) => !item.correlation));
+        if (fragmentByID || (candidate && candidate.delta <= mediaToleranceSeconds)) { bind(fragmentByID || candidate.item, control); retry(); }
+        else {
+          if (!fragments.length) {
+            controls.set(control.sequence, control); if (controls.size > maxFragments) controls.delete(controls.keys().next().value);
+            return;
+          }
+          emitComparison("frame_correlation_control_no_match", control, nearestFragment(control.mediaTime, fragments), fragments.length);
+          controls.set(control.sequence, control); if (controls.size > maxFragments) controls.delete(controls.keys().next().value);
+        }
+      },
+      frame(now, metadata) { if (closed) return; expire(now); const frame = { now, metadata }; if (!match(frame)) { callbacks.push(frame); expire(now); } },
+      finish(now) { if (closed) return; expire(now); retry(); while (callbacks.length) { callbacks.shift(); fail(); } closed = true; fragments.length = 0; controls.clear(); },
+      snapshot: () => ({ fragments: fragments.length, controls: controls.size, callbacks: callbacks.length, counts: { ...counts } })
+    };
+  }
+  function createFramePacingSummary(emit) {
+    // Fixed histogram: full-session percentiles rounded up to 1 ms; >10 s is overflow.
+    const cadence = () => ({ count: 0, first: null, last: null, max: 0, bursts: 0, histogram: new Uint32Array(10002) });
+    const render = cadence(); const append = cadence();
+    let firstPresented = null; let lastPresented = null; let presentedJumps = 0; let finished = false;
+    const add = (value, now) => {
+      if (value.last !== null) { const interval = Math.max(0, now - value.last); value.max = Math.max(value.max, interval); if (interval < 8) value.bursts += 1; value.histogram[Math.min(10001, Math.ceil(interval))] += 1; }
+      if (value.first === null) value.first = now;
+      value.last = now; value.count += 1;
+    };
+    const summarize = (value) => {
+      const percentile = (fraction) => { const target = Math.ceil((value.count - 1) * fraction); if (target <= 0) return null; let count = 0; for (let i = 0; i < value.histogram.length; i += 1) { count += value.histogram[i]; if (count >= target) return i; } return null; };
+      return { count: value.count, durationMs: value.count > 1 ? Math.round(value.last - value.first) : 0, p50Ms: percentile(0.5), p95Ms: percentile(0.95), maxMs: value.count > 1 ? Math.round(value.max) : null, burstUnder8Ms: value.bursts, intervalOverflow: value.histogram[10001] };
+    };
+    return {
+      frame(now, metadata) {
+        if (finished) return;
+        add(render, now);
+        if (Number.isFinite(metadata.presentedFrames)) { if (firstPresented === null) firstPresented = metadata.presentedFrames; if (lastPresented !== null && metadata.presentedFrames - lastPresented > 1) presentedJumps += 1; lastPresented = metadata.presentedFrames; }
+      },
+      append(now) { if (!finished) add(append, now); },
+      stop(counts) {
+        if (finished) return null;
+        finished = true;
+        const r = summarize(render); const a = summarize(append);
+        const delta = firstPresented === null ? null : Math.max(0, lastPresented - firstPresented);
+        const summary = { render: r, append: a, presentedFramesDelta: delta, presentedFPSMilli: delta !== null && r.durationMs > 0 ? Math.round(delta * 1000000 / r.durationMs) : null, presentedJumps, uncorrelated: counts.rendered_frame_uncorrelated_no_fragment_match || 0, lateBound: counts.frame_correlation_late_bound || 0, lateBindExpired: counts.frame_correlation_late_bind_expired || 0 };
+        // Numeric, allowlisted category characters survive the existing iOS diagnostic exporter.
+        const fields = (object) => Object.entries(object).map(([key, value]) => `${key}_${value === null ? "na" : value}`).join("_");
+        emit(`frame_pacing_summary_render_${fields(r)}`);
+        emit(`frame_pacing_summary_append_${fields(a)}`);
+        emit(`frame_pacing_summary_presentedFramesDelta_${delta === null ? "na" : delta}_presentedFPSMilli_${summary.presentedFPSMilli === null ? "na" : summary.presentedFPSMilli}_presentedJumps_${presentedJumps}_uncorrelated_no_fragment_match_${summary.uncorrelated}_lateBound_${summary.lateBound}_lateBindExpired_${summary.lateBindExpired}`);
+        return summary;
+      }
+    };
+  }
+  function send(senderId, requestId, result) {
+    context.sendCustomMessage(NAMESPACE, senderId, makeResult(requestId, result));
+  }
+  function probeWebSocket(event) {
+    const request = validateProbe(event.data);
+    if (!event || !event.senderId || !request) { return; }
+    capabilityReadyPromise.then(() => runWebSocketProbe(event.senderId, request));
+  }
+  function validateMediaStart(data) {
+    const message = parse(data);
+    const keys = message && Object.keys(message);
+    if (!message || (keys.length !== 4 && keys.length !== 5) || message.type !== "startMedia" ||
+        message.protocolVersion !== PROTOCOL_VERSION || typeof message.requestId !== "string" ||
+        !REQUEST_ID.test(message.requestId) || typeof message.endpoint !== "string" || !validEndpoint(message.endpoint)) return null;
+    if (keys.length === 5 && message.audioCodec !== "mp4a.40.2") return null;
+    return message;
+  }
+  function sendMediaResult(senderId, requestId, result, telemetry, observedReceiverTime) {
+    const payload = { type: "mediaResult", protocolVersion: PROTOCOL_VERSION, requestId, receiverVersion: RECEIVER_VERSION, result };
+    if (["receiver_first_message_received", "receiver_auth_validation_passed", "receiver_media_ready_received"].includes(result)
+        || result.startsWith("first_frame_callback_presented_") || result.startsWith("first_fragment_seq_")) {
+      payload.receiverUptimeMs = performance.now();
+    }
+    if (Number.isFinite(observedReceiverTime)) payload.receiverUptimeMs = observedReceiverTime;
+    if (telemetry) payload.telemetry = telemetry;
+    context.sendCustomMessage(NAMESPACE, senderId, payload);
+  }
+  function sendReceiverDiagnostic(event, request, result) {
+    if (!event || !event.senderId || !request || typeof request.requestId !== "string") return;
+    sendMediaResult(event.senderId, request.requestId, result);
+  }
+  function createMediaCreditEmitter(generation, send) {
+    let creditSequence = 0;
+    return () => {
+      creditSequence += 1;
+      const credit = { type: "mediaCredit", protocolVersion: PROTOCOL_VERSION, generation, credits: 1, creditSequence };
+      if (global.console && typeof global.console.info === "function") global.console.info("ScreenMirror mediaCredit", { generation, creditSequence });
+      send(credit);
+    };
+  }
+  // Diagnostic fingerprint only. Includes actual startup/playback code and closed-over
+  // settings plus receiver capabilities; never includes request IDs, endpoints or tokens.
+  // FNV-1a is a comparison checksum, not a security hash.
+  function effectiveReceiverConfigHash(runtime) {
+    const value = JSON.stringify({ schema: 1, revision: RECEIVER_REVISION,
+      protocolVersion: PROTOCOL_VERSION, namespace: NAMESPACE, mime: MIME_TYPE,
+      maxMessageBytes: MAX_MESSAGE_BYTES, retainedHistorySeconds: RETAINED_HISTORY_SECONDS,
+      trimHistoryThresholdSeconds: TRIM_HISTORY_THRESHOLD_SECONDS,
+      fastThresholdSeconds: LIVE_EDGE_FAST_THRESHOLD_SECONDS,
+      normalThresholdSeconds: LIVE_EDGE_NORMAL_THRESHOLD_SECONDS,
+      fastPlaybackRate: LIVE_EDGE_FAST_PLAYBACK_RATE,
+      implementation: [runMedia, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate].map(String),
+      runtime: { frameCallback: !!runtime.frameCallback, mediaSource: !!runtime.mediaSource,
+        avcMIME: !!runtime.avcMIME, sourceBuffer: !!runtime.sourceBuffer, autoplay: runtime.autoplay } });
+    let hash = 2166136261;
+    for (const byte of new TextEncoder().encode(value)) hash = Math.imul(hash ^ byte, 16777619) >>> 0;
+    return `fnv1a32_${hash.toString(16).padStart(8, "0")}`;
+  }
+  function createInitialAudioCreditDelivery(send, canDeliver) {
+    let pending = false; let authenticated = false; let sent = false;
+    const flush = () => {
+      if (!pending || sent || !authenticated || !canDeliver()) return false;
+      if (!send()) return false;
+      sent = true; pending = false;
+      return true;
+    };
+    return {
+      ready() { pending = true; return flush(); },
+      authenticated() { authenticated = true; return flush(); },
+      flush,
+      close() { pending = false; authenticated = false; },
+      get sent() { return sent; }
+    };
+  }
+  function runMedia(event, request) {
+    const mediaRun = ++activeMediaRun;
+    const healthyCatchup = createHealthyLiveEdgeCatchup(mediaRun);
+    sendCapabilityDiagnostics(event, request);
+    if (!capabilityResult()) {
+      sendReceiverDiagnostic(event, request, "receiver_error_before_disconnect_unsupported");
+      sendMediaResult(event.senderId, request.requestId, "unsupported");
+      return;
+    }
+    const video = document.getElementById("probe-video");
+    document.body.classList.add("media-active");
+    document.body.classList.remove("receiver-idle");
+    sendMediaResult(event.senderId, request.requestId, `receiver_revision_reported_${RECEIVER_REVISION}`);
+    try { sendMediaResult(event.senderId, request.requestId, `effective_receiver_config_hash_${effectiveReceiverConfigHash({
+      ...capabilities, frameCallback: typeof video.requestVideoFrameCallback === "function"
+    })}`); } catch (_) { /* Diagnostics never gate media startup. */ }
+    const pending = []; const maxPending = 8;
+    const audioRequested = request.audioCodec === "mp4a.40.2";
+    const audioPending = []; const maxAudioPending = 4;
+    const flowGeneration = 1; const initialCredits = 8; let mediaReadySent = false;
+    let mediaAuthenticated = false; let audioInitAppended = false;
+    let playbackSampleTimer; let playbackSamples = 0; let renderedCallbacks = 0; let presentedFrames = 0;
+    let lastAppendAtMs = null; let lastRenderAtMs = null; let renderedMediaTime = NaN;
+    let decodeDuration = NaN; let displayLead = NaN; let receiverDrops = 0;
+    let seekCount = 0; let lastSeekKind = 0; let rateChanges = 0;
+    let source; let buffer; let audioBuffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingFragment = null; let lastAppendingSyncTimes = []; const syncPoints = []; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let healthySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let lastAudioType = 0; let audioTrimPending = false; let audioCreditSequence = 0; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
+    if (activeReceiverPagehideListener && typeof global.removeEventListener === "function") {
+      global.removeEventListener("pagehide", activeReceiverPagehideListener);
+    }
+    activeReceiverPagehideListener = () => {
+      try {
+        sendMediaResult(event.senderId, request.requestId,
+          receiverStopped ? "receiver_document_pagehide_after_stop" : "receiver_document_pagehide_during_media");
+      } catch (_) { /* Lifecycle diagnostics never affect receiver state. */ }
+    };
+    if (typeof global.addEventListener === "function") {
+      global.addEventListener("pagehide", activeReceiverPagehideListener, { once: true });
+    }
+    let reconnectingScreenTimer;
+    let latencyFallback = false; let frameCallbackID;
+    // Preserve the existing timeupdate fallback on receivers without rVFC.
+    const latencyCorrelations = new Map();
+    const sendLatency = (value) => {
+      try { if (socket && socket.readyState === 1) { socket.send(JSON.stringify(value)); return true; } } catch (_) {}
+      return false;
+    };
+    const initialAudioCredits = createInitialAudioCreditDelivery(() => {
+      const delivered = sendLatency({ type: "audioReady", protocolVersion: PROTOCOL_VERSION, generation: flowGeneration, initialCredits: maxAudioPending });
+      if (delivered) {
+        try { sendMediaResult(event.senderId, request.requestId, "receiver_audio_initial_credits_sent"); }
+        catch (_) { /* Diagnostics never change credit ownership. */ }
+      }
+      return delivered;
+    }, () => !receiverStopped && mediaRun === activeMediaRun && socket && socket.readyState === 1);
+    const captureStageMetrics = () => ({ bufferLeadMs: Math.round(bufferedLead(video) * 1000), pendingDepth: Math.max(0, Math.min(maxPending, pending.length)) });
+    const sendLatencyStage = (stage, sequence, at, metrics) => {
+      const message = makeLatencyStage(flowGeneration, sequence, stage, at, metrics.bufferLeadMs, metrics.pendingDepth);
+      if (message) sendLatency(message);
+    };
+    // Each runMedia call owns one receiver generation/session, so this counter
+    // resets when that session is replaced while remaining monotonic in-session.
+    const emitMediaCredit = createMediaCreditEmitter(flowGeneration, sendLatency);
+    const confirmFirstRendered = (metadata) => {
+      if (!canConfirmFirstRendered(firstRendered, firstMediaAppended, metadata)) return;
+      firstRendered = true;
+      const presentedFrames = Math.max(1, Math.floor(metadata.presentedFrames));
+      sendMediaResult(event.senderId, request.requestId, `first_frame_callback_presented_${presentedFrames}`);
+      context.sendCustomMessage(NAMESPACE, event.senderId, { type: "firstRenderedFrame", protocolVersion: PROTOCOL_VERSION, requestId: request.requestId, receiverVersion: RECEIVER_VERSION, appendBacklogHighWatermark });
+    };
+    const pacing = createFramePacingSummary((result) => sendMediaResult(event.senderId, request.requestId, result));
+    const correlations = createFrameCorrelationTracker(flowGeneration,
+      (result) => sendMediaResult(event.senderId, request.requestId, result), sendLatencyStage,
+      (now, metadata, correlation) => sendLatency({ type: "renderedFrame", generation: correlation.generation, sequence: correlation.sequence, receiverTimeMs: now, mediaTimeMs: Math.round(metadata.mediaTime * 1000), presentedFrames: Number.isFinite(metadata.presentedFrames) ? metadata.presentedFrames : 0, bufferLeadMs: metadata.bufferLeadMs }));
+    const clearPlaybackSampleTimer = () => {
+      if (playbackSampleTimer !== undefined && typeof global.clearInterval === "function") global.clearInterval(playbackSampleTimer);
+      playbackSampleTimer = undefined;
+    };
+    const sendPeriodicPlaybackSample = () => {
+      if (receiverStopped || mediaRun !== activeMediaRun || !mediaAuthenticated || !socket || socket.readyState !== 1) {
+        clearPlaybackSampleTimer(); return;
+      }
+      if (playbackSamples >= 120) { clearPlaybackSampleTimer(); return; }
+      const nowMs = performance.now();
+      const sample = makePeriodicPlaybackSample(video, buffer, {
+        generation: flowGeneration, sampleIndex: playbackSamples + 1, nowMs,
+        queueDepth: pending.length, receiverDrops, appendedFragments, renderedCallbacks, presentedFrames,
+        uncorrelatedFrames: correlations.snapshot().counts.rendered_frame_uncorrelated_no_fragment_match || 0,
+        lastAppendAtMs, lastRenderAtMs, renderedMediaTime, decodeDuration, displayLead,
+        seekCount, lastSeekKind, rateChanges
+      });
+      if (sendLatency(sample)) playbackSamples += 1;
+    };
+    const startPlaybackSamples = () => {
+      if (playbackSampleTimer === undefined && typeof global.setInterval === "function") {
+        playbackSampleTimer = global.setInterval(sendPeriodicPlaybackSample, 5000);
+      }
+    };
+    const observeFrame = (now, metadata) => {
+      if (receiverStopped) return;
+      renderedCallbacks += 1;
+      lastRenderAtMs = now;
+      if (Number.isFinite(metadata.presentedFrames)) presentedFrames = metadata.presentedFrames;
+      renderedMediaTime = metadata.mediaTime;
+      decodeDuration = metadata.processingDuration;
+      displayLead = Number.isFinite(metadata.expectedDisplayTime) ? (metadata.expectedDisplayTime - now) / 1000 : NaN;
+      confirmFirstRendered(metadata);
+      // A decoded frame can resume after MSE waiting without another
+      // "playing" event. Clear the overlay only on actual frame presentation.
+      if (firstRendered && ui && !ui.panel.hidden && !video.paused && !video.ended) showScreen("playing");
+      pacing.frame(now, metadata);
+      correlations.frame(now, { ...metadata, bufferLeadMs: Math.round(bufferedLead(video) * 1000) });
+    };
+    const installFrameObserver = () => {
+      if (typeof video.requestVideoFrameCallback === "function") {
+        sendLatency({ type: "latencyCapability", mode: "requestVideoFrameCallback" });
+        const next = (now, metadata) => { if (receiverStopped) return; observeFrame(now, metadata); frameCallbackID = video.requestVideoFrameCallback(next); };
+        frameCallbackID = video.requestVideoFrameCallback(next);
+      } else { latencyFallback = true; sendLatency({ type: "latencyCapability", mode: "playbackAckFallback" }); }
+    };
+    const clearInitAppendTimeout = () => { if (initAppendTimeout) { global.clearTimeout(initAppendTimeout); initAppendTimeout = undefined; } };
+    const clearPlayTimeout = () => { if (playTimeout) { global.clearTimeout(playTimeout); playTimeout = undefined; } };
+    const clearRecoveryTimeout = () => { if (lastPlayback.recoveryTimeout) { global.clearTimeout(lastPlayback.recoveryTimeout); lastPlayback.recoveryTimeout = undefined; } };
+    const clearReconnectingScreenTimer = () => { if (reconnectingScreenTimer) { global.clearTimeout(reconnectingScreenTimer); reconnectingScreenTimer = undefined; } };
+    const scheduleReconnectingScreen = () => {
+      if (receiverStopped || !firstRendered || reconnectingScreenTimer) return;
+      reconnectingScreenTimer = global.setTimeout(() => {
+        reconnectingScreenTimer = undefined;
+        if (shouldShowReconnectingScreen(firstRendered, receiverStopped, lastPlayback.advancedAt, performance.now(), stallThresholdMs)) showScreen("reconnecting");
+      }, stallThresholdMs);
+    };
+    const clearVideoForReceiverStop = (screen) => {
+      if (receiverStopped) return;
+      receiverStopped = true;
+      healthyCatchup.close();
+      healthySeekPending = false;
+      recoverySeekPending = false;
+      correlations.finish(performance.now());
+      pacing.stop(correlations.snapshot().counts);
+      if (frameCallbackID !== undefined && typeof video.cancelVideoFrameCallback === "function") video.cancelVideoFrameCallback(frameCallbackID);
+      clearRecoveryTimeout();
+      clearReconnectingScreenTimer();
+      clearPlaybackSampleTimer();
+      pending.length = 0;
+      audioPending.length = 0;
+      audioTrimPending = false;
+      initialAudioCredits.close();
+      mediaAuthenticated = false;
+      // Explicitly release this generation's SourceBuffers (and the audio
+      // decoder behind audioBuffer in particular) before detaching src, rather
+      // than only relying on garbage collection once these locals go out of
+      // scope. On rapid back-to-back casts the next generation's addSourceBuffer
+      // call for audio can otherwise run before the platform has freed the
+      // previous decoder instance, which throws and silently degrades to
+      // video-only.
+      try {
+        if (source && source.readyState === "open") {
+          if (audioBuffer && !audioBuffer.updating) { try { source.removeSourceBuffer(audioBuffer); } catch (_) {} }
+          if (buffer && !buffer.updating) { try { source.removeSourceBuffer(buffer); } catch (_) {} }
+        }
+      } catch (_) {}
+      audioBuffer = null; buffer = null;
+      try { video.pause(); video.removeAttribute("src"); video.load(); } catch (_) {}
+      document.body.classList.remove("media-active");
+      document.body.classList.add("receiver-idle");
+      showScreen(screen);
+      sendMediaResult(event.senderId, request.requestId, "receiver_video_cleared");
+      sendMediaResult(event.senderId, request.requestId, "receiver_idle_screen_shown");
+      if (screen === "stopped") sendMediaResult(event.senderId, request.requestId, "receiver_casting_stopped_screen_shown");
+      if (screen === "lost") sendMediaResult(event.senderId, request.requestId, "receiver_connection_lost_screen_shown");
+    };
+    const stop = (result) => { clearInitAppendTimeout(); clearPlayTimeout(); clearPlaybackSampleTimer(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
+    const safePlayRejection = (error) => {
+      if (error && error.name === "NotAllowedError") return "play_rejected_not_allowed";
+      if (error && error.name === "NotSupportedError") return "play_rejected_not_supported";
+      if (error && error.name === "AbortError") return "play_rejected_abort";
+      return "play_rejected_other";
+    };
+    const boundedMs = (value) => Number.isFinite(value) && value >= 0 && value <= 3600 ? Math.round(value * 1000) : null;
+    const playbackTelemetry = (checkpoint) => {
+      const ranges = video.buffered;
+      const hasRange = ranges && ranges.length > 0;
+      const durationKind = Number.isNaN(video.duration) ? "nan" : video.duration === Infinity ? "infinite" : Number.isFinite(video.duration) ? "finite" : "unknown";
+      sendMediaResult(event.senderId, request.requestId, "playback_state", {
+        checkpoint,
+        readyState: Math.max(0, Math.min(4, video.readyState || 0)),
+        networkState: Math.max(0, Math.min(3, video.networkState || 0)),
+        paused: !!video.paused,
+        ended: !!video.ended,
+        currentTimeMs: boundedMs(video.currentTime) || 0,
+        durationKind,
+        bufferedLength: Math.max(0, Math.min(8, hasRange ? ranges.length : 0)),
+        bufferStartMs: hasRange ? boundedMs(ranges.start(0)) : null,
+        bufferEndMs: hasRange ? boundedMs(ranges.end(0)) : null,
+        mediaSourceState: source && ["open", "ended", "closed"].includes(source.readyState) ? source.readyState : "unknown",
+        sourceBufferUpdating: !!(buffer && buffer.updating),
+        videoBufferRanges: Math.max(0, Math.min(8, buffer && buffer.buffered ? buffer.buffered.length : 0)),
+        audioBufferRanges: Math.max(0, Math.min(8, audioBuffer && audioBuffer.buffered ? audioBuffer.buffered.length : 0)),
+        audioBufferCreated: !!audioBuffer,
+        audioInitAppended,
+        audioBufferUpdating: !!(audioBuffer && audioBuffer.updating),
+        mediaErrorCode: video.error && Number.isInteger(video.error.code) ? video.error.code : 0,
+        appendedFragments,
+        keyframeAppended: firstKeyframe && firstMediaAppended,
+        queueDepth: Math.max(0, Math.min(8, pending.length))
+      });
+    };
+    const attemptPlay = () => {
+      if (playAttempted || !initialSeekCompleted || !firstKeyframe || !firstMediaAppended || !buffer || buffer.updating) return;
+      playAttempted = true;
+      playbackTelemetry("before_play");
+      sendMediaResult(event.senderId, request.requestId, "play_attempt_started");
+      let promise;
+      try { promise = video.play(); } catch (_) { sendMediaResult(event.senderId, request.requestId, "play_synchronous_exception"); return; }
+      sendMediaResult(event.senderId, request.requestId, "play_promise_pending");
+      playTimeout = global.setTimeout(() => {
+        playbackTelemetry("play_pending_timeout");
+        sendMediaResult(event.senderId, request.requestId, "play_pending_timeout");
+      }, 5000);
+      Promise.resolve(promise).then(() => {
+        clearPlayTimeout();
+        sendMediaResult(event.senderId, request.requestId, "play_promise_resolved");
+        if (!receiverStopped && audioRequested && audioBuffer) {
+          video.muted = false;
+          sendMediaResult(event.senderId, request.requestId, "receiver_audio_unmuted");
+        }
+      }).catch((error) => {
+        clearPlayTimeout();
+        sendMediaResult(event.senderId, request.requestId, safePlayRejection(error));
+      });
+    };
+    const ensurePlayablePosition = () => {
+      if (initialSeekRequested || !firstKeyframe || !firstMediaAppended || !buffer || buffer.updating || !video.buffered || !video.buffered.length) return;
+      const start = video.buffered.start(0);
+      const end = video.buffered.end(0);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
+      if (video.currentTime >= start && video.currentTime <= end) {
+        initialSeekCompleted = true;
+        attemptPlay();
+        return;
+      }
+      initialSeekRequested = true;
+      seekCount += 1; lastSeekKind = 1;
+      playbackTelemetry("initial_seek_requested");
+      const target = start + Math.min(0.05, Math.max(0, (end - start) / 2));
+      sendMediaResult(event.senderId, request.requestId, "initial_seek_requested");
+      try { video.currentTime = target; } catch (_) { sendMediaResult(event.senderId, request.requestId, "initial_seek_failed"); }
+    };
+    const recoverPlaybackPosition = () => {
+      if (!initialSeekCompleted || recoverySeekPending || !firstRendered || !buffer || buffer.updating || !video.buffered || !video.buffered.length) return;
+      const target = recoverySeekTarget(video.currentTime, video.buffered.start(0), video.buffered.end(0));
+      if (target === null) return;
+      recoverySeekPending = true;
+      seekCount += 1; lastSeekKind = 2;
+      sendMediaResult(event.senderId, request.requestId, "receiver_live_edge_recovery_seek");
+      try { video.currentTime = target; } catch (_) { recoverySeekPending = false; sendMediaResult(event.senderId, request.requestId, "recovery_seek_failed"); }
+    };
+    // Mid-cast, the video element can end up paused (seen on MiTV after the
+    // iPhone's red status-bar control paused ReplayKit twice and the Cast
+    // control session was suspended): media kept arriving for minutes, but
+    // every recovery path below requires !video.paused, so the TV stayed on
+    // "Reconnecting" forever. A live mirror is never intentionally paused
+    // while running, so resume at the newest buffered video. Rate-limited.
+    let lastUnexpectedPauseResumeAt = -Infinity;
+    const resumeUnexpectedPause = () => {
+      if (receiverStopped || mediaRun !== activeMediaRun || !initialSeekCompleted || recoverySeekPending
+          || !firstRendered || !video.paused || video.ended || !video.buffered || !video.buffered.length) return;
+      const now = performance.now();
+      if (now - lastUnexpectedPauseResumeAt < stallThresholdMs) return;
+      lastUnexpectedPauseResumeAt = now;
+      const last = video.buffered.length - 1;
+      const start = video.buffered.start(last); const end = video.buffered.end(last);
+      playbackTelemetry("receiver_unexpected_pause_resume");
+      sendMediaResult(event.senderId, request.requestId, "receiver_unexpected_pause_resume");
+      try {
+        if (Number.isFinite(start) && Number.isFinite(end) && end > start
+            && (video.currentTime < start || video.currentTime > end)) {
+          // Playhead is in a gap (no media there): jump to the newest video;
+          // the "seeked" handler calls play() because the element is paused.
+          recoverySeekPending = true;
+          seekCount += 1; lastSeekKind = 4;
+          video.currentTime = Math.max(start + 0.05, end - 0.05);
+        } else {
+          Promise.resolve(video.play()).catch((error) => sendMediaResult(event.senderId, request.requestId, safePlayRejection(error)));
+        }
+      } catch (_) {
+        recoverySeekPending = false;
+        sendMediaResult(event.senderId, request.requestId, "receiver_unexpected_pause_resume_failed");
+      }
+    };
+    const detectPlaybackStall = () => {
+      if (video.paused && !video.ended) { resumeUnexpectedPause(); return; }
+      if (!initialSeekCompleted || recoverySeekPending || !firstRendered || video.paused || video.ended || !video.buffered || !video.buffered.length) return;
+      const start = video.buffered.start(0); const end = video.buffered.end(video.buffered.length - 1);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end - video.currentTime < recoveryMinimumLeadSeconds) return;
+      if (performance.now() - lastPlayback.advancedAt < stallThresholdMs) return;
+      const target = stalledLiveEdgeSeekTarget(video.currentTime, start, end);
+      if (target === null || target - video.currentTime < 0.02) return;
+      playbackTelemetry("receiver_playback_stall_detected");
+      sendMediaResult(event.senderId, request.requestId, "receiver_playback_stall_detected");
+      recoverySeekPending = true;
+      seekCount += 1; lastSeekKind = 3;
+      lastPlayback.recoveryAwaitingProgress = true;
+      sendMediaResult(event.senderId, request.requestId, "receiver_live_edge_recovery_seek");
+      try {
+        video.currentTime = target;
+        clearRecoveryTimeout();
+        lastPlayback.recoveryTimeout = global.setTimeout(() => {
+          if (!lastPlayback.recoveryAwaitingProgress) return;
+          lastPlayback.recoveryAwaitingProgress = false;
+          sendMediaResult(event.senderId, request.requestId, "receiver_playback_recovery_failed");
+          playbackTelemetry("receiver_playback_recovery_failed");
+        }, recoveryTimeoutMs);
+      } catch (_) {
+        recoverySeekPending = false; lastPlayback.recoveryAwaitingProgress = false;
+        sendMediaResult(event.senderId, request.requestId, "receiver_playback_recovery_failed");
+      }
+    };
+    const catchUpHealthyPlayback = () => {
+      if (receiverStopped || mediaRun !== activeMediaRun || !firstRendered || !initialSeekCompleted
+          || recoverySeekPending || !mediaAuthenticated || !socket || socket.readyState !== 1
+          || !buffer || buffer.updating || (audioRequested && audioBuffer && audioBuffer.updating)) return;
+      const now = performance.now();
+      const target = healthyCatchup.consider({
+        runID: mediaRun, nowMs: now, currentTime: video.currentTime,
+        videoRanges: readBufferedRanges(video.buffered),
+        audioRanges: audioRequested && audioBuffer ? readBufferedRanges(audioBuffer.buffered) : [],
+        syncPoints, audioRequested, audioReady: !!audioBuffer && audioInitAppended && !video.muted,
+        readyState: video.readyState, paused: video.paused, ended: video.ended, seeking: video.seeking,
+        mediaError: !!video.error, sourceOpen: !!source && source.readyState === "open",
+        videoUpdating: !!buffer && buffer.updating, audioUpdating: !!audioBuffer && audioBuffer.updating,
+        pendingDepth: pending.length, progressAgeMs: now - lastPlayback.advancedAt,
+        appendAgeMs: lastAppendAtMs === null ? Infinity : now - lastAppendAtMs,
+        renderAgeMs: lastRenderAtMs === null ? null : now - lastRenderAtMs
+      });
+      if (target === null) return;
+      recoverySeekPending = true;
+      healthySeekPending = true;
+      seekCount += 1; lastSeekKind = 4;
+      playbackTelemetry("healthy_live_edge_catchup_requested");
+      sendMediaResult(event.senderId, request.requestId, "healthy_live_edge_catchup_seek");
+      try { video.currentTime = target; }
+      catch (_) {
+        recoverySeekPending = false;
+        healthySeekPending = false;
+        healthyCatchup.completeSeek(mediaRun);
+        sendMediaResult(event.senderId, request.requestId, "healthy_live_edge_catchup_seek_failed");
+      }
+    };
+    const regulateLiveEdge = () => {
+      // One element carries both tracks; never speed audible AAC for long.
+      const nextRate = audioRequested
+        ? (video.playbackRate === 1 ? null : 1)
+        : liveEdgePlaybackRate(bufferedLead(video), video.playbackRate);
+      if (nextRate === null || nextRate === video.playbackRate) return;
+      video.playbackRate = nextRate;
+      rateChanges += 1;
+      sendMediaResult(event.senderId, request.requestId, nextRate > 1 ? "live_edge_catchup_enabled" : "live_edge_catchup_disabled");
+    };
+    const appendNext = () => {
+      if (!buffer || buffer.updating || !pending.length) return;
+      const item = pending.shift(); lastAppendingType = item.type; lastAppendingFragment = item.fragment || null;
+      lastAppendingSyncTimes = item.syncTimes || [];
+      if (item.type === 1) {
+        initAppendPending = true;
+        sendMediaResult(event.senderId, request.requestId, `init_append_started_len_${item.payload.byteLength}`);
+        initAppendTimeout = global.setTimeout(() => {
+          if (initAppendPending) { sendMediaResult(event.senderId, request.requestId, "init_append_timeout"); stop("append_failed"); }
+        }, 5000);
+      }
+      if (item.type === 2) {
+        mediaAppendPending = true;
+        correlations.start(lastAppendingFragment, performance.now(), captureStageMetrics());
+        sendMediaResult(event.senderId, request.requestId, `media_append_started_len_${item.payload.byteLength}`);
+      }
+      try { buffer.appendBuffer(item.payload); } catch (_) {
+        if (item.type === 1) sendMediaResult(event.senderId, request.requestId, "init_append_synchronous_exception");
+        if (item.type === 2) sendMediaResult(event.senderId, request.requestId, "media_append_synchronous_exception");
+        stop("append_failed");
+      }
+    };
+    const emitAudioCredit = () => {
+      if (!audioBuffer || !initialAudioCredits.sent || receiverStopped || mediaRun !== activeMediaRun || !mediaAuthenticated) return;
+      audioCreditSequence += 1;
+      sendLatency({ type: "audioCredit", protocolVersion: PROTOCOL_VERSION, generation: flowGeneration, credits: 1, creditSequence: audioCreditSequence });
+    };
+    const degradeAudio = (result) => {
+      try { sendMediaResult(event.senderId, request.requestId, result); }
+      catch (_) { /* Audio diagnostics cannot block video cleanup. */ }
+      audioPending.length = 0;
+      audioTrimPending = false;
+      initialAudioCredits.close();
+      const failedBuffer = audioBuffer;
+      audioBuffer = null;
+      if (failedBuffer && source && source.readyState === "open" && !failedBuffer.updating) {
+        try { source.removeSourceBuffer(failedBuffer); }
+        catch (_) { sendMediaResult(event.senderId, request.requestId, "receiver_audio_buffer_remove_failed_video_continues"); }
+      }
+    };
+    const appendNextAudio = () => {
+      if (!audioBuffer || audioBuffer.updating || !audioPending.length) return;
+      const item = audioPending.shift(); lastAudioType = item.type;
+      if (item.type === 4 && !audioInitAppended) {
+        degradeAudio("audio_fragment_before_init_video_continues");
+        return;
+      }
+      try {
+        audioBuffer.appendBuffer(item.payload);
+        sendMediaResult(event.senderId, request.requestId, item.type === 3 ? "audio_init_append_started" : "audio_fragment_append_started");
+      } catch (_) {
+        degradeAudio("audio_append_failed_video_continues");
+      }
+    };
+    const trimAudioHistory = () => {
+      if (receiverStopped || !audioBuffer || !audioInitAppended || audioBuffer.updating || typeof audioBuffer.remove !== "function") return false;
+      const ranges = readBufferedRanges(audioBuffer.buffered);
+      const current = containingRange(ranges, video.currentTime);
+      const end = current ? bufferedTrimEnd(video.currentTime, ranges[0].start, current.end) : null;
+      if (end === null) return false;
+      audioTrimPending = true;
+      try { audioBuffer.remove(0, end); return true; }
+      catch (_) { audioTrimPending = false; return false; }
+    };
+    const enqueueAudio = (item) => {
+      if (!audioBuffer) { sendMediaResult(event.senderId, request.requestId, "audio_fragment_ignored_not_ready"); return; }
+      if (audioPending.length >= maxAudioPending) {
+        audioPending.shift();
+        sendMediaResult(event.senderId, request.requestId, "audio_queue_evicted");
+      }
+      audioPending.push(item);
+      appendNextAudio();
+    };
+    const enqueue = (item) => {
+      if (pending.length >= maxPending) { pending.splice(0, pending.length - maxPending + 1); receiverDrops += 1; }
+      pending.push(item); appendBacklogHighWatermark = Math.max(appendBacklogHighWatermark, pending.length); appendNext();
+    };
+    try {
+      source = new global.MediaSource(); video.src = global.URL.createObjectURL(source); video.muted = true; video.playsInline = true;
+      source.addEventListener("sourceopen", () => {
+        try {
+          buffer = source.addSourceBuffer(MIME_TYPE);
+          sendMediaResult(event.senderId, request.requestId, "source_buffer_created");
+          // Rapid successive stop/start cycles can ask the platform to create a
+          // new audio decoder instance before the previous generation's one has
+          // finished releasing (observed as addSourceBuffer throwing here on a
+          // device that has just been through back-to-back broadcasts). That is
+          // a transient resource race, not "this device can't play AAC", so one
+          // short-delay retry is attempted before degrading to video-only.
+          const attachAudioBuffer = (attemptsLeft) => {
+            if (receiverStopped || mediaRun !== activeMediaRun || source.readyState !== "open") return;
+            try {
+              audioBuffer = source.addSourceBuffer(AUDIO_MIME_TYPE);
+              sendMediaResult(event.senderId, request.requestId, "receiver_audio_source_buffer_created");
+              sendMediaResult(event.senderId, request.requestId, "receiver_audio_ready");
+              initialAudioCredits.ready();
+              audioBuffer.addEventListener("updateend", () => {
+                if (receiverStopped || mediaRun !== activeMediaRun) return;
+                if (audioTrimPending) { audioTrimPending = false; appendNextAudio(); return; }
+                if (lastAudioType === 3) {
+                  audioInitAppended = true;
+                  sendMediaResult(event.senderId, request.requestId, "audio_init_append_updateend");
+                } else if (lastAudioType === 4 && initialAudioCredits.sent) {
+                  sendMediaResult(event.senderId, request.requestId, "audio_fragment_append_updateend");
+                  emitAudioCredit();
+                }
+                if (trimAudioHistory()) return;
+                appendNextAudio();
+              });
+              audioBuffer.addEventListener("error", () => {
+                degradeAudio("receiver_audio_error_video_continues");
+              });
+            } catch (error) {
+              audioBuffer = null;
+              const reason = (error && error.name) ? error.name : "unknown_error";
+              if (attemptsLeft > 0) {
+                sendMediaResult(event.senderId, request.requestId, `receiver_audio_source_buffer_retry_scheduled_${reason}`);
+                // Back-to-back casts can be seconds apart or milliseconds apart;
+                // a device that has just been through many rapid cycles can need
+                // much longer than a few seconds to release the previous
+                // generation's audio decoder, so this backs off across several
+                // attempts, totalling ~24s, before accepting video-only.
+                const delayMs = [400, 800, 1600, 3200, 5000, 7000][6 - attemptsLeft] || 7000;
+                global.setTimeout(() => attachAudioBuffer(attemptsLeft - 1), delayMs);
+                return;
+              }
+              sendMediaResult(event.senderId, request.requestId, `receiver_audio_unsupported_video_continues_${reason}`);
+            }
+          };
+          if (audioRequested && global.MediaSource.isTypeSupported(AUDIO_MIME_TYPE) === true) {
+            attachAudioBuffer(6);
+          } else if (audioRequested) {
+            sendMediaResult(event.senderId, request.requestId, "receiver_audio_skipped_codec_unsupported");
+          }
+          buffer.addEventListener("updateend", () => {
+            if (receiverStopped || mediaRun !== activeMediaRun) return;
+            if (lastAppendingType === 1 && initAppendPending) {
+              initAppendPending = false;
+              clearInitAppendTimeout();
+              sendMediaResult(event.senderId, request.requestId, "init_append_updateend");
+              if (!mediaReadySent) {
+                mediaReadySent = true;
+                sendReceiverDiagnostic(event, request, "receiver_media_ready_received");
+                sendLatency({ type: "mediaReady", protocolVersion: PROTOCOL_VERSION, generation: flowGeneration, initialCredits });
+              }
+            }
+            if (lastAppendingType === 2) firstMediaAppended = true;
+            if (lastAppendingType === 2 && mediaAppendPending) {
+              mediaAppendPending = false;
+              appendedFragments += 1;
+              lastAppendAtMs = performance.now();
+              for (const syncTime of lastAppendingSyncTimes) {
+                syncPoints.push(syncTime);
+                if (syncPoints.length > 16) syncPoints.shift();
+              }
+              correlations.append(lastAppendingFragment, performance.now(), captureStageMetrics());
+              pacing.append(performance.now());
+              sendMediaResult(event.senderId, request.requestId, "media_append_updateend");
+              if (mediaReadySent) emitMediaCredit();
+              playbackTelemetry("first_media_append");
+            }
+            ensurePlayablePosition();
+            attemptPlay();
+            recoverPlaybackPosition();
+            detectPlaybackStall();
+            catchUpHealthyPlayback();
+            regulateLiveEdge();
+            // Preserve a full GOP behind the playhead. Trimming at 0.1 seconds
+            // can evict the current decode dependency and force a recovery seek.
+            const videoRanges = readBufferedRanges(video.buffered);
+            const currentVideoRange = containingRange(videoRanges, video.currentTime);
+            const trimEnd = currentVideoRange
+              ? bufferedTrimEnd(video.currentTime, videoRanges[0].start, currentVideoRange.end) : null;
+            if (trimEnd !== null && typeof buffer.remove === "function" && !buffer.updating) {
+              try { buffer.remove(0, trimEnd); } catch (_) {}
+            }
+            appendNext();
+          });
+          buffer.addEventListener("error", () => {
+            if (lastAppendingType === 1 && initAppendPending) sendMediaResult(event.senderId, request.requestId, "init_append_error_event");
+            if (lastAppendingType === 2 && mediaAppendPending) sendMediaResult(event.senderId, request.requestId, "media_append_error_event");
+            stop("append_failed");
+          });
+          buffer.addEventListener("abort", () => {
+            if (lastAppendingType === 1 && initAppendPending) sendMediaResult(event.senderId, request.requestId, "init_append_abort_event");
+            if (lastAppendingType === 2 && mediaAppendPending) sendMediaResult(event.senderId, request.requestId, "media_append_abort_event");
+            stop("append_aborted");
+          });
+          sendReceiverDiagnostic(event, request, "receiver_endpoint_connect_attempted");
+          try {
+            socket = new global.WebSocket(request.endpoint);
+          } catch (constructorError) {
+            // A page served over https: may have this throw synchronously
+            // (mixed-content / Private Network Access rejection) before any
+            // onerror/onopen ever fires, which previously left the sender
+            // waiting silently for a first-rendered-frame that could never
+            // arrive. This is additive diagnostics only, not a transport fix.
+            sendReceiverDiagnostic(event, request,
+              `receiver_endpoint_websocket_constructor_threw_${(constructorError && constructorError.name) || "unknown"}`);
+            stop("websocket_failed");
+            return;
+          }
+          socket.binaryType = "arraybuffer";
+          let socketOpened = false;
+          const socketConnectTimeout = global.setTimeout(() => {
+            if (!socketOpened) sendReceiverDiagnostic(event, request, "receiver_endpoint_connect_timeout");
+          }, 8000);
+          socket.onopen = () => {
+            socketOpened = true;
+            global.clearTimeout(socketConnectTimeout);
+            sendReceiverDiagnostic(event, request, "receiver_endpoint_fetch_started");
+            socket.send(JSON.stringify({ type: "hello", token: new URL(request.endpoint).pathname.slice(1), protocolVersion: PROTOCOL_VERSION }));
+            installFrameObserver();
+          };
+          socket.onmessage = (message) => {
+            if (typeof message.data === "string") {
+              const control = parse(message.data); if (!control) { stop("protocol_error"); return; }
+              if (control.type === "readyForMedia" && control.protocolVersion === PROTOCOL_VERSION && Object.keys(control).length === 2) {
+                mediaAuthenticated = true;
+                startPlaybackSamples();
+                initialAudioCredits.authenticated();
+                sendReceiverDiagnostic(event, request, "receiver_auth_validation_passed");
+                sendReceiverDiagnostic(event, request, "receiver_endpoint_fetch_succeeded");
+                return;
+              }
+              if (control.type === "normalStop" && control.protocolVersion === PROTOCOL_VERSION && Object.keys(control).length === 2) {
+                sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
+                clearVideoForReceiverStop("stopped");
+                try { socket.close(1000, "normal_stop"); } catch (_) {}
+                return;
+              }
+              if (control.type === "clockPing" && Number.isFinite(control.t1) && Number.isInteger(control.sequence)) { const t2 = performance.now(); sendLatency({ type: "clockPong", sequence: control.sequence, t1: control.t1, t2, t3: performance.now() }); return; }
+              if (control.type === "frameCorrelation" && Number.isInteger(control.generation) && Number.isInteger(control.sequence) && Number.isFinite(control.mediaTimeMs)) { correlations.control(control, performance.now());
+                if (latencyFallback) {
+                  if (latencyCorrelations.size >= 256) latencyCorrelations.delete(latencyCorrelations.keys().next().value);
+                  latencyCorrelations.set(control.sequence, { generation: control.generation, sequence: control.sequence, mediaTime: control.mediaTimeMs / 1000 });
+                }
+                return;
+              }
+              sendReceiverDiagnostic(event, request, "receiver_auth_validation_failed");
+              sendReceiverDiagnostic(event, request, "receiver_error_before_disconnect_protocol_error");
+              stop("protocol_error"); return;
+            }
+            const envelope = parseEnvelope(message.data); if (!envelope) { stop("binary_envelope_invalid"); return; }
+            if (envelope.type === 1) { enqueue(envelope); return; }
+            if (envelope.type === 2) {
+              const summary = summarizeFragment(envelope.payload);
+              let fragment = null;
+              if (summary) {
+                fragment = correlations.receive(envelope.sequence, summary.decodeTime / 90000, performance.now(), captureStageMetrics());
+                sendMediaResult(event.senderId, request.requestId, `media_fragment_received_len_${envelope.payload.byteLength}`);
+                sendMediaResult(event.senderId, request.requestId, `first_fragment_seq_${summary.sequence}_samples_${summary.sampleCount}_tfdt_${summary.decodeTime}_offset_${summary.dataOffset}_payload_${summary.payloadLength}_nal_${summary.firstNALType}`);
+              } else {
+                sendMediaResult(event.senderId, request.requestId, "media_fragment_layout_invalid");
+              }
+              firstKeyframe = true;
+              enqueue({ ...envelope, fragment, syncTimes: summary ? summary.syncTimes : [] });
+              return;
+            }
+            if (envelope.type === 3 || envelope.type === 4) {
+              if (!audioRequested) { sendMediaResult(event.senderId, request.requestId, "audio_envelope_rejected_not_negotiated"); return; }
+              enqueueAudio(envelope); return;
+            }
+            stop("binary_envelope_invalid");
+          };
+          let socketFailed = false;
+          socket.onerror = () => {
+            socketFailed = true;
+            global.clearTimeout(socketConnectTimeout);
+            if (!firstRendered) {
+              sendReceiverDiagnostic(event, request, "receiver_endpoint_fetch_failed");
+              sendReceiverDiagnostic(event, request, "receiver_error_before_disconnect_websocket_error");
+            }
+            stop("websocket_failed");
+          }; socket.onclose = (closeEvent) => {
+            global.clearTimeout(socketConnectTimeout);
+            mediaAuthenticated = false;
+            clearPlaybackSampleTimer();
+            initialAudioCredits.close();
+            if (!receiverStopped) {
+              sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
+              clearVideoForReceiverStop(closeScreen(closeEvent, socketFailed));
+            }
+            if (!firstRendered) {
+              const code = closeEvent && Number.isInteger(closeEvent.code) ? closeEvent.code : 0;
+              sendReceiverDiagnostic(event, request, "receiver_endpoint_fetch_failed");
+              sendReceiverDiagnostic(event, request, `receiver_error_before_disconnect_websocket_closed_${code}`);
+              sendMediaResult(event.senderId, request.requestId, "websocket_closed");
+            }
+          };
+          sendMediaResult(event.senderId, request.requestId, "media_socket_connecting");
+        } catch (_) { stop("sourcebuffer_failed"); }
+      }, { once: true });
+      source.addEventListener("sourceended", () => sendMediaResult(event.senderId, request.requestId, "media_source_state_ended"));
+      source.addEventListener("sourceclose", () => sendMediaResult(event.senderId, request.requestId, "media_source_state_closed"));
+      video.addEventListener("error", () => sendMediaResult(event.senderId, request.requestId, `media_element_error_code_${video.error ? video.error.code : 0}`));
+      video.addEventListener("loadedmetadata", () => sendMediaResult(event.senderId, request.requestId, "media_event_loadedmetadata"));
+      video.addEventListener("loadeddata", () => sendMediaResult(event.senderId, request.requestId, "media_event_loadeddata"));
+      video.addEventListener("canplay", () => sendMediaResult(event.senderId, request.requestId, "media_event_canplay"));
+      video.addEventListener("canplaythrough", () => sendMediaResult(event.senderId, request.requestId, "media_event_canplaythrough"));
+      video.addEventListener("waiting", () => {
+        scheduleReconnectingScreen();
+        sendMediaResult(event.senderId, request.requestId, "media_event_waiting");
+      });
+      video.addEventListener("stalled", () => {
+        scheduleReconnectingScreen();
+        sendMediaResult(event.senderId, request.requestId, "media_event_stalled");
+      });
+      video.addEventListener("seeking", () => sendMediaResult(event.senderId, request.requestId, recoverySeekPending ? "recovery_seek_started" : "initial_seek_started"));
+      video.addEventListener("seeked", () => {
+        if (receiverStopped || mediaRun !== activeMediaRun) return;
+        if (recoverySeekPending) {
+          recoverySeekPending = false;
+          healthyCatchup.completeSeek(mediaRun);
+          const healthy = healthySeekPending;
+          healthySeekPending = false;
+          sendMediaResult(event.senderId, request.requestId,
+            healthy ? "healthy_live_edge_catchup_completed" : "recovery_seek_completed");
+          if (!healthy || video.paused) {
+            try { Promise.resolve(video.play()).catch((error) => sendMediaResult(event.senderId, request.requestId, safePlayRejection(error))); } catch (_) { sendMediaResult(event.senderId, request.requestId, "recovery_play_synchronous_exception"); }
+          }
+          return;
+        }
+        if (!initialSeekRequested) return;
+        initialSeekCompleted = true;
+        playbackTelemetry("before_play");
+        sendMediaResult(event.senderId, request.requestId, "initial_seek_completed");
+        attemptPlay();
+      });
+      video.addEventListener("playing", () => {
+        clearReconnectingScreenTimer();
+        if (!receiverStopped && !ui.panel.hidden) showScreen("playing");
+        sendMediaResult(event.senderId, request.requestId, "media_event_playing");
+      });
+      video.addEventListener("timeupdate", () => {
+        if (!timeUpdated) { timeUpdated = true; sendMediaResult(event.senderId, request.requestId, "media_event_timeupdate"); }
+        if (video.currentTime > lastPlayback.time + 0.01) {
+          lastPlayback.time = video.currentTime;
+          lastPlayback.advancedAt = performance.now();
+          if (lastPlayback.recoveryAwaitingProgress) {
+            lastPlayback.recoveryAwaitingProgress = false;
+            clearRecoveryTimeout();
+            sendMediaResult(event.senderId, request.requestId, "receiver_playback_recovered");
+            playbackTelemetry("receiver_playback_recovered");
+          }
+        }
+        catchUpHealthyPlayback();
+        if (latencyFallback && latencyCorrelations.size) { const mediaTime = video.currentTime; const nearest = Array.from(latencyCorrelations.values()).sort((a, b) => Math.abs(a.mediaTime - mediaTime) - Math.abs(b.mediaTime - mediaTime))[0]; if (nearest && Math.abs(nearest.mediaTime - mediaTime) <= 0.05) { latencyCorrelations.delete(nearest.sequence); sendLatency({ type: "renderedFrame", generation: nearest.generation, sequence: nearest.sequence, receiverTimeMs: performance.now(), mediaTimeMs: Math.round(mediaTime * 1000), presentedFrames: 0, bufferLeadMs: Math.round(bufferedLead(video) * 1000), fallback: true }); } }
+      });
+    } catch (_) { stop("media_source_failed"); }
+  }
+  function parseEnvelope(value) {
+    if (!(value instanceof ArrayBuffer) || value.byteLength < 14) return null;
+    const bytes = new Uint8Array(value); const view = new DataView(value);
+    if (String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]) !== "SMC1" || bytes[4] !== 2 || ![1, 2, 3, 4].includes(bytes[5])) return null;
+    const length = view.getUint32(10); if (length !== bytes.length - 14 || length > 1048576) return null;
+    return { type: bytes[5], sequence: view.getUint32(6), payload: value.slice(14) };
+  }
+  function summarizeFragment(value) {
+    if (!(value instanceof ArrayBuffer)) return null;
+    const bytes = new Uint8Array(value); const view = new DataView(value);
+    const readBoxes = (start, end) => {
+      const result = []; for (let offset = start; offset + 8 <= end;) {
+        const size = view.getUint32(offset); if (size < 8 || offset + size > end) return null;
+        result.push({ offset, size, type: String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]) }); offset += size;
+      } return result;
+    };
+    const top = readBoxes(0, bytes.length); if (!top) return null;
+    const moof = top.find((box) => box.type === "moof"); const mdat = top.find((box) => box.type === "mdat");
+    if (!moof || !mdat) return null;
+    const moofChildren = readBoxes(moof.offset + 8, moof.offset + moof.size); if (!moofChildren) return null;
+    const mfhd = moofChildren.find((box) => box.type === "mfhd"); const traf = moofChildren.find((box) => box.type === "traf"); if (!mfhd || !traf) return null;
+    const trafChildren = readBoxes(traf.offset + 8, traf.offset + traf.size); if (!trafChildren) return null;
+    const tfdt = trafChildren.find((box) => box.type === "tfdt"); const trun = trafChildren.find((box) => box.type === "trun"); if (!tfdt || !trun || trun.size < 20) return null;
+    const version = bytes[tfdt.offset + 8]; const decodeTime = version === 1 ? Number(view.getBigUint64(tfdt.offset + 12)) : view.getUint32(tfdt.offset + 12);
+    const dataOffset = view.getUint32(trun.offset + 16); const payloadStart = moof.offset + dataOffset;
+    if (payloadStart < mdat.offset + 8 || payloadStart + 5 > mdat.offset + mdat.size) return null;
+    const nalLength = view.getUint32(payloadStart); if (nalLength === 0 || payloadStart + 4 + nalLength > mdat.offset + mdat.size) return null;
+    // The sender marks every IDR sample in trun, including an IDR that is
+    // not the first sample of a fragment. Bound parsing and index only the
+    // successfully appended random-access points.
+    const sampleCount = view.getUint32(trun.offset + 12);
+    const trunVersion = bytes[trun.offset + 8];
+    const flags = view.getUint32(trun.offset + 8) & 0x00ffffff;
+    const hasSampleFields = (flags & 0x000701) === 0x000701;
+    const hasCTO = (flags & 0x000800) !== 0;
+    const stride = hasCTO ? 16 : 12;
+    const syncTimes = [];
+    if (hasSampleFields && sampleCount > 0 && sampleCount <= 32
+        && trun.offset + 20 + sampleCount * stride <= trun.offset + trun.size) {
+      let time = decodeTime; let totalSize = 0;
+      for (let i = 0; i < sampleCount; i += 1) {
+        const offset = trun.offset + 20 + i * stride;
+        const duration = view.getUint32(offset); const size = view.getUint32(offset + 4);
+        const sampleFlags = view.getUint32(offset + 8);
+        totalSize += size;
+        if (!duration || !size || totalSize > mdat.size - 8) { syncTimes.length = 0; break; }
+        const cto = hasCTO ? (trunVersion === 1 ? view.getInt32(offset + 12) : view.getUint32(offset + 12)) : 0;
+        if (sampleFlags === 0x02000000 && Number.isSafeInteger(time + cto) && time + cto >= 0) {
+          syncTimes.push((time + cto) / 90000);
+        }
+        time += duration;
+      }
+    }
+    return { sequence: view.getUint32(mfhd.offset + 12), sampleCount, decodeTime, dataOffset, payloadLength: mdat.size - 8, firstNALType: bytes[payloadStart + 4] & 0x1f, syncStart: syncTimes.includes(decodeTime / 90000), syncTimes };
+  }
+  function bufferedLead(video) {
+    for (let i = 0; i < video.buffered.length; i += 1) if (video.currentTime >= video.buffered.start(i) && video.currentTime <= video.buffered.end(i)) return video.buffered.end(i) - video.currentTime;
+    return 0;
+  }
+  const visibilitySubscribers = new Set();
+  let lastReportedVisibility = null;
+  function currentVisibility() {
+    let documentState = "unknown", cafVisibility = "UNKNOWN", cafStandby = "UNKNOWN";
+    try { if (global.document && typeof global.document.visibilityState === "string") documentState = global.document.visibilityState; } catch (_) {}
+    try { if (context && typeof context.getVisibilityState === "function") cafVisibility = String(context.getVisibilityState()); } catch (_) {}
+    try { if (context && typeof context.getStandbyState === "function") cafStandby = String(context.getStandbyState()); } catch (_) {}
+    return resolveVisibility(documentState, cafVisibility, cafStandby);
+  }
+  function notifyVisibilityChanged() {
+    const visibility = currentVisibility();
+    if (visibility === lastReportedVisibility) return;
+    lastReportedVisibility = visibility;
+    for (const senderId of visibilitySubscribers) {
+      try { context.sendCustomMessage(NAMESPACE, senderId, makeVisibilityReport("visibility-change", visibility)); } catch (_) {}
+    }
+  }
+  function receiverMessage(event) {
+    const visibilityQuery = event && validateVisibilityQuery(event.data);
+    if (visibilityQuery) {
+      if (typeof event.senderId === "string") {
+        if (visibilitySubscribers.size >= 4) visibilitySubscribers.delete(visibilitySubscribers.values().next().value);
+        visibilitySubscribers.add(event.senderId);
+        const visibility = currentVisibility();
+        lastReportedVisibility = visibility;
+        context.sendCustomMessage(NAMESPACE, event.senderId, makeVisibilityReport(visibilityQuery.requestId, visibility));
+      }
+      return;
+    }
+    const readyQuery = event && validateReadyQuery(event.data);
+    if (readyQuery) {
+      capabilityReadyPromise.then((runtime) => {
+        const audioSupported = !!(runtime && runtime.mediaSource) && global.MediaSource.isTypeSupported(AUDIO_MIME_TYPE) === true;
+        if (event.senderId) {
+          context.sendCustomMessage(NAMESPACE, event.senderId,
+            makeReadyReport(readyQuery.requestId, receiverReadinessState, audioSupported));
+          lifecycleDiagnostics.readySent(readyQuery.requestId);
+        }
+      });
+      return;
+    }
+    const probe = event && validateProbe(event.data); if (probe) { capabilityReadyPromise.then(() => runWebSocketProbe(event.senderId, probe)); return; }
+    const raw = event && parse(event.data);
+    const canReportMediaValidation = raw && raw.type === "startMedia" && typeof raw.requestId === "string" && REQUEST_ID.test(raw.requestId);
+    if (canReportMediaValidation) {
+      sendReceiverDiagnostic(event, raw, "receiver_namespace_opened");
+      sendReceiverDiagnostic(event, raw, "receiver_first_message_received");
+    }
+    const media = event && validateMediaStart(event.data);
+    if (media) {
+      lifecycleDiagnostics.mediaRequested();
+      emitReceiverStartup(event, media);
+      sendReceiverDiagnostic(event, media, `receiver_page_loaded_revision_${RECEIVER_REVISION}`);
+      sendReceiverDiagnostic(event, media, "receiver_media_payload_validation_passed");
+      capabilityReadyPromise.then(() => runMedia(event, media));
+      return;
+    }
+    if (canReportMediaValidation) {
+      sendReceiverDiagnostic(event, raw, "receiver_media_payload_validation_failed");
+    }
+    // Unrecognized commands have no user-facing presentation.
+  }
+  function runWebSocketProbe(senderId, request) {
+    if (!capabilityResult()) { send(senderId, request.requestId, RESULT.FAILED); return; }
+    let socket;
+    let finished = false;
+    let timeoutRef = { id: null };
+    const complete = (result, terminalStatus, probeAckStatus) => {
+      if (finished) return;
+      finished = true;
+      if (timeoutRef.id !== null) global.clearTimeout(timeoutRef.id);
+      try { socket && socket.close(); } catch (_) {}
+      capabilities = Object.freeze({ ...capabilities, probeAckStatus, terminalStatus });
+      send(senderId, request.requestId, result);
+      // Probe completion does not overwrite the casting screen.
+    };
+    let opened = false;
+    try {
+      socket = new global.WebSocket(request.endpoint);
+      socket.onopen = () => {
+        opened = true;
+        capabilities = Object.freeze({ ...capabilities, websocketAttempted: true, websocketLifecycle: "opened" });
+        socket.send(JSON.stringify({ type: "hello", token: new URL(request.endpoint).pathname.slice(1) }));
+      };
+      socket.onmessage = (message) => {
+        const acknowledgement = parse(message.data);
+        if (acknowledgement && acknowledgement.type === "ack" && Object.keys(acknowledgement).length === 1) {
+          capabilities = Object.freeze({ ...capabilities, websocketAuthenticated: true, websocketLifecycle: "ack_received" });
+          socket.send(JSON.stringify({ type: "confirmed" }));
+          global.setTimeout(() => complete(RESULT.PASS, "capability_pass", "confirmed"), 50);
+        } else {
+          complete(RESULT.FAILED, "capability_failed", "rejected");
+        }
+      };
+      socket.onerror = () => {
+        if (capabilities.websocketAuthenticated) {
+          complete(RESULT.PASS, "capability_pass", "confirmed");
+          return;
+        }
+        capabilities = Object.freeze({ ...capabilities, websocketLifecycle: opened ? "error_after_open" : "error_before_open" });
+        complete(RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error");
+      };
+      socket.onclose = () => {
+        if (!finished) {
+          if (capabilities.websocketAuthenticated) {
+            complete(RESULT.PASS, "capability_pass", "confirmed");
+            return;
+          }
+          capabilities = Object.freeze({ ...capabilities, websocketLifecycle: opened ? "closed_before_auth" : "error_before_open" });
+          complete(RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error");
+        }
+      };
+    } catch (error) {
+      const securityRejected = error && error.name === "SecurityError";
+      capabilities = Object.freeze({ ...capabilities, websocketLifecycle: securityRejected ? "constructor_security_rejected" : "error_before_open" });
+      complete(securityRejected ? RESULT.MIXED_CONTENT_BLOCKED : RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error");
+      return;
+    }
+    timeoutRef.id = global.setTimeout(() => {
+      capabilities = Object.freeze({ ...capabilities, websocketLifecycle: "transport_timeout" });
+      complete(RESULT.WEBSOCKET_FAILED, "capability_failed", "transport_error");
+    }, 5000);
+  }
+  function testCapabilities(video) {
+    const result = { webSocketAPI: typeof global.WebSocket === "function", mediaSource: typeof global.MediaSource === "function", avcMIME: false, sourceBuffer: false, autoplay: "deferred", websocketAttempted: false, websocketAuthenticated: false, probeAckStatus: "not_attempted", terminalStatus: "capability_partial", websocketLifecycle: "not_attempted" };
+    let avcMIMEException = "none";
+    if (result.mediaSource) {
+      try { result.avcMIME = global.MediaSource.isTypeSupported(MIME_TYPE) === true; }
+      catch (error) { avcMIMEException = safeException(error); }
+    }
+    const sourceBufferReady = new Promise((resolve) => {
+      if (!result.avcMIME) { capabilityProbeTrace.settled = "avc_unsupported"; resolve(false); return; }
+      const startedAt = receiverNow();
+      let timedOut = false;
+      try {
+        const source = new global.MediaSource();
+        capabilityProbeTrace.source = source;
+        video.src = global.URL.createObjectURL(source);
+        const timeout = global.setTimeout(() => {
+          timedOut = true;
+          capabilityProbeTrace.settled = "timeout_before_sourceopen";
+          capabilityProbeTrace.sourceStateAtTimeout = safeMediaSourceState(source);
+          resolve({ value: false, exception: "timeout" });
+        }, 1500);
+        source.addEventListener("sourceopen", () => {
+          global.clearTimeout(timeout);
+          capabilityProbeTrace.sourceOpen = timedOut ? "after_timeout" : "before_timeout";
+          const observedAt = receiverNow();
+          const delay = Number.isFinite(startedAt) && Number.isFinite(observedAt) ? observedAt - startedAt : -1;
+          capabilityProbeTrace.sourceOpenDelayMs = Number.isFinite(delay) && delay >= 0 ? Math.min(60000, Math.round(delay)) : -1;
+          capabilityProbeTrace.addSourceBuffer = "attempted";
+          try {
+            const added = !!source.addSourceBuffer(MIME_TYPE);
+            capabilityProbeTrace.addSourceBuffer = added ? "succeeded" : "returned_false";
+            if (!timedOut) capabilityProbeTrace.settled = added ? "sourcebuffer_created" : "sourcebuffer_unavailable";
+            resolve({ value: added, exception: "none" });
+          } catch (error) {
+            capabilityProbeTrace.addSourceBuffer = "threw";
+            if (!timedOut) capabilityProbeTrace.settled = "sourcebuffer_exception";
+            resolve({ value: false, exception: safeException(error) });
+          }
+        }, { once: true });
+      } catch (error) {
+        capabilityProbeTrace.settled = capabilityProbeTrace.source ? "attach_exception" : "constructor_exception";
+        resolve({ value: false, exception: safeException(error) });
+      }
+    });
+    return sourceBufferReady.then((sourceBufferProbe) => {
+      const sourceBuffer = typeof sourceBufferProbe === "boolean" ? sourceBufferProbe : sourceBufferProbe.value;
+      const sourceBufferException = typeof sourceBufferProbe === "boolean" ? "none" : sourceBufferProbe.exception;
+      capabilities = Object.freeze({ ...result, sourceBuffer });
+      capabilityProbe = Object.freeze({
+        avcMIMEOutcome: result.avcMIME ? "true" : "false",
+        avcMIMEException,
+        sourceBufferOutcome: sourceBuffer ? "true" : "false",
+        sourceBufferException
+      });
+
+      return capabilities;
+    });
+  }
+  // Observability only. No timers, transport messages, CAF mutations or media.
+  function createLifecycleDiagnostics(env, scriptStartedAt) {
+    const VERSION = "caf-idle-observe-20261017-01";
+    const MAX_EVENTS = 64, MAX_NORMAL = 48, WINDOW_MS = 360000;
+    const records = [], counts = Object.create(null);
+    const critical = new Set(["receiver_caf_shutdown", "receiver_caf_error", "receiver_pagehide",
+      "receiver_beforeunload", "receiver_page_error", "receiver_promise_rejection"]);
+    const names = new Set(["receiver_page_started", "receiver_caf_context_initialized",
+      "receiver_caf_start_requested", "receiver_caf_start_returned", "receiver_caf_options_snapshot", "receiver_caf_ready",
+      "receiver_caf_shutdown", "receiver_sender_connected", "receiver_sender_disconnected",
+      "receiver_caf_error", "receiver_caf_visibility_changed", "receiver_caf_standby_changed",
+      "receiver_visibility_changed", "receiver_pagehide", "receiver_beforeunload",
+      "receiver_page_error", "receiver_promise_rejection", "receiver_ready_transmitted",
+      "receiver_ready_correlation", "receiver_media_request_observed", "receiver_diag_hook_unavailable"]);
+    const token = (value, allowed) => typeof value === "string" && allowed.includes(value.toUpperCase())
+      ? value.toUpperCase() : "UNKNOWN";
+    const safeError = (value) => {
+      try { return token(value && value.name, ["ERROR", "TYPEERROR", "REFERENCEERROR", "RANGEERROR",
+        "SYNTAXERROR", "URIERROR", "EVALERROR", "AGGREGATEERROR", "DOMEXCEPTION"]); }
+      catch (_) { return "UNKNOWN"; }
+    };
+    const now = () => { try { const n = env.performance && env.performance.now(); return Number.isFinite(n) ? n : null; } catch (_) { return null; } };
+    const wall = () => { try { const n = env.Date.now(); return Number.isFinite(n) ? n : null; } catch (_) { return null; } };
+    const startedAt = Number.isFinite(scriptStartedAt) ? scriptStartedAt : now(), startedWall = wall();
+    let context = null, framework = null, normalCount = 0, elapsed = 0, recording = false, mediaRequested = false;
+    let nonce = "unavailable";
+    try { nonce = `page_${env.Math.random().toString(36).slice(2, 14)}`; } catch (_) {}
+    function snapshotState() {
+      const state = { cafVersion: "unavailable", cafState: "UNKNOWN", playerState: "UNKNOWN", cafVisibility: "UNKNOWN", cafStandby: "UNKNOWN", senderCount: null };
+      try {
+        const version = framework && framework.VERSION;
+        if (typeof version === "string" && /^[A-Za-z0-9._-]{1,32}$/.test(version)) state.cafVersion = version;
+      } catch (_) {}
+      try { if (context && typeof context.getSystemState === "function") state.cafState = token(context.getSystemState(),
+        ["NOT_STARTED", "STARTING_IN_BACKGROUND", "STARTING", "READY", "STOPPING_IN_BACKGROUND", "STOPPING"]); } catch (_) {}
+      try { if (context && typeof context.getVisibilityState === "function") state.cafVisibility = token(context.getVisibilityState(), ["VISIBLE", "NOT_VISIBLE", "UNKNOWN"]); } catch (_) {}
+      try { if (context && typeof context.getStandbyState === "function") state.cafStandby = token(context.getStandbyState(), ["STANDBY", "NOT_STANDBY", "UNKNOWN"]); } catch (_) {}
+      try {
+        const player = context && typeof context.getPlayerManager === "function" && context.getPlayerManager();
+        if (player && typeof player.getPlayerState === "function") state.playerState = token(player.getPlayerState(),
+          ["IDLE", "LOADING", "BUFFERING", "PLAYING", "PAUSED"]);
+      } catch (_) {}
+      try {
+        const senders = context && typeof context.getSenders === "function" && context.getSenders();
+        if (Array.isArray(senders)) state.senderCount = Math.min(16, senders.length);
+      } catch (_) {}
+      return state;
+    }
+    function record(name, detail) {
+      if (recording) return null;
+      recording = true;
+      try {
+        const current = now(), currentWall = wall();
+        const delta = current !== null && startedAt !== null ? current - startedAt
+          : currentWall !== null && startedWall !== null ? currentWall - startedWall : 0;
+        elapsed = Math.max(elapsed, Number.isFinite(delta) ? delta : 0);
+        const important = critical.has(name);
+        if (!names.has(name) || elapsed > WINDOW_MS || records.length >= MAX_EVENTS
+          || (!important && normalCount >= MAX_NORMAL) || (counts[name] || 0) >= (important ? 2 : 6)) return null;
+        counts[name] = (counts[name] || 0) + 1;
+        if (!important) normalCount += 1;
+        const entry = { event: name, diagnosticVersion: VERSION, pageNonce: nonce,
+          sequence: records.length + 1, elapsedMs: Math.round(elapsed), monotonicMs: current,
+          wallTimeMs: currentWall, receiverRevision: RECEIVER_REVISION, mediaRequested, ...snapshotState() };
+        try { entry.documentVisibility = token(env.document && env.document.visibilityState, ["VISIBLE", "HIDDEN", "PRERENDER", "UNLOADED"]); } catch (_) {}
+        detail = detail || {};
+        if (typeof detail.persisted === "boolean") entry.persisted = detail.persisted;
+        if (typeof detail.errorClass === "string") entry.errorClass = token(detail.errorClass,
+          ["ERROR", "TYPEERROR", "REFERENCEERROR", "RANGEERROR", "SYNTAXERROR", "URIERROR", "EVALERROR", "AGGREGATEERROR", "DOMEXCEPTION"]);
+        if (typeof detail.disconnectReason === "string") entry.disconnectReason = token(detail.disconnectReason,
+          ["REQUESTED_BY_SENDER", "ERROR", "UNKNOWN"]);
+        if (typeof detail.requestHash === "string" && /^[0-9a-f]{24}$/.test(detail.requestHash)) entry.requestHash = detail.requestHash;
+        if (Number.isInteger(detail.readySequence) && detail.readySequence > 0 && detail.readySequence <= MAX_EVENTS) entry.readySequence = detail.readySequence;
+        if (typeof detail.phase === "string") entry.phase = token(detail.phase, ["GLOBAL", "CAF", "PAGE"]);
+        if (typeof detail.idleTimeoutOption === "string") entry.idleTimeoutOption = token(detail.idleTimeoutOption, ["DEFAULT", "TRUE", "FALSE"]);
+        if (typeof detail.maxInactivityOption === "string") entry.maxInactivityOption = token(detail.maxInactivityOption, ["DEFAULT", "EXPLICIT", "UNKNOWN"]);
+        if (Number.isFinite(detail.maxInactivitySeconds) && detail.maxInactivitySeconds >= 0 && detail.maxInactivitySeconds <= 3600) entry.maxInactivitySeconds = detail.maxInactivitySeconds;
+        const frozen = Object.freeze(entry);
+        records.push(frozen);
+        try { if (env.console && typeof env.console.info === "function") env.console.info("ScreenMirror lifecycle", frozen); } catch (_) {}
+        return entry.sequence;
+      } catch (_) { return null; }
+      finally { recording = false; }
+    }
+    function listen(target, event, callback, phase) {
+      try { if (target && typeof target.addEventListener === "function") target.addEventListener(event, (value) => { try { callback(value); } catch (_) {} }); }
+      catch (_) { record("receiver_diag_hook_unavailable", { phase }); }
+    }
+    function installGlobal() {
+      listen(env.document, "visibilitychange", () => record("receiver_visibility_changed"), "PAGE");
+      listen(env, "pagehide", (event) => record("receiver_pagehide", { persisted: !!(event && event.persisted) }), "GLOBAL");
+      listen(env, "beforeunload", () => { record("receiver_beforeunload"); }, "GLOBAL");
+      listen(env, "error", (event) => record("receiver_page_error", { errorClass: safeError(event && event.error) }), "GLOBAL");
+      listen(env, "unhandledrejection", (event) => record("receiver_promise_rejection", { errorClass: safeError(event && event.reason) }), "GLOBAL");
+      record("receiver_page_started");
+    }
+    function installCAF(value, api) {
+      context = value; framework = api;
+      record("receiver_caf_context_initialized");
+      const mapping = { READY: "receiver_caf_ready", SHUTDOWN: "receiver_caf_shutdown",
+        SENDER_CONNECTED: "receiver_sender_connected", SENDER_DISCONNECTED: "receiver_sender_disconnected",
+        ERROR: "receiver_caf_error", VISIBILITY_CHANGED: "receiver_caf_visibility_changed",
+        STANDBY_CHANGED: "receiver_caf_standby_changed" };
+      for (const key of Object.keys(mapping)) {
+        try {
+          const type = api && api.system && api.system.EventType && api.system.EventType[key];
+          if (typeof type !== "string") continue;
+          listen(context, type, (event) => record(mapping[key], key === "SENDER_DISCONNECTED"
+            ? { disconnectReason: event && event.reason } : {}), "CAF");
+        } catch (_) { record("receiver_diag_hook_unavailable", { phase: "CAF" }); }
+      }
+    }
+    function readySent(requestID) {
+      const sequence = record("receiver_ready_transmitted");
+      // Never await diagnostics or put identifiers in console/Ready payloads.
+      try {
+        if (sequence === null || !env.crypto || !env.crypto.subtle || typeof requestID !== "string") return;
+        Promise.resolve(env.crypto.subtle.digest("SHA-256", new env.TextEncoder().encode(requestID)))
+          .then((bytes) => {
+            try {
+              const hash = Array.from(new Uint8Array(bytes).slice(0, 12)).map((v) => v.toString(16).padStart(2, "0")).join("");
+              record("receiver_ready_correlation", { requestHash: hash, readySequence: sequence });
+            } catch (_) {}
+          }).catch(() => {});
+      } catch (_) {}
+    }
+    function optionsSnapshot(options) {
+      try {
+        const idle = options.disableIdleTimeout, inactivity = options.maxInactivity;
+        record("receiver_caf_options_snapshot", { idleTimeoutOption: typeof idle === "boolean" ? String(idle) : "DEFAULT",
+          maxInactivityOption: inactivity === undefined ? "DEFAULT" : "EXPLICIT", maxInactivitySeconds: inactivity });
+      } catch (_) { record("receiver_diag_hook_unavailable", { phase: "CAF" }); }
+    }
+    return Object.freeze({ record, installGlobal, installCAF, readySent, optionsSnapshot,
+      mediaRequested() { mediaRequested = true; record("receiver_media_request_observed"); },
+      snapshot() { return records.slice(); }, diagnosticVersion: VERSION });
+  }
+  const lifecycleDiagnostics = createLifecycleDiagnostics(global, startupTiming.receiver_page_script_started);
+  try { lifecycleDiagnostics.installGlobal(); } catch (_) {}
+  try { global.ScreenMirrorReceiverLifecycleDiagnostics = Object.freeze({
+    diagnosticVersion: lifecycleDiagnostics.diagnosticVersion, snapshot: () => lifecycleDiagnostics.snapshot() }); } catch (_) {}
+
+  function boot() {
+    ui = { panel: document.getElementById("idle-screen"), title: document.getElementById("status-title"), detail: document.getElementById("status-detail") };
+    showScreen("ready");
+    const video = document.getElementById("probe-video");
+    capabilityReadyPromise = testCapabilities(video);
+    if (!global.cast || !global.cast.framework) { showScreen("lost"); return; }
+    context = global.cast.framework.CastReceiverContext.getInstance();
+    lifecycleDiagnostics.installCAF(context, global.cast.framework);
+    if (typeof context.addEventListener === "function") {
+      const types = global.cast.framework.system.EventType;
+      context.addEventListener(types.READY, () => recordReceiverStartup("receiver_caf_context_ready"));
+      context.addEventListener(types.SENDER_CONNECTED, (event) => {
+        if (!event || typeof event.senderId !== "string") return;
+        if (senderConnections.size >= 4) senderConnections.delete(senderConnections.keys().next().value);
+        senderConnections.set(event.senderId, receiverNow());
+        // Previously silent: the receiver knew a phone had connected but
+        // never said so on screen, so a slow or failed handshake looked
+        // identical to nothing happening. Only show it while still idle —
+        // never interrupt an already-playing cast or override a more
+        // specific in-progress state.
+        if (receiverReadinessState !== "mirroring" && ui && ui.panel.hidden === false) showScreen("connected");
+      });
+    }
+    try {
+      const types = global.cast.framework.system.EventType;
+      if (typeof context.addEventListener === "function") {
+        if (types.VISIBILITY_CHANGED) context.addEventListener(types.VISIBILITY_CHANGED, notifyVisibilityChanged);
+        if (types.STANDBY_CHANGED) context.addEventListener(types.STANDBY_CHANGED, notifyVisibilityChanged);
+        if (types.SENDER_DISCONNECTED) context.addEventListener(types.SENDER_DISCONNECTED, (event) => {
+          if (event && typeof event.senderId === "string") visibilitySubscribers.delete(event.senderId);
+        });
+      }
+      document.addEventListener("visibilitychange", notifyVisibilityChanged);
+    } catch (_) {}
+    context.addCustomMessageListener(NAMESPACE, receiverMessage);
+    recordReceiverStartup("receiver_namespace_registered");
+    const options = new global.cast.framework.CastReceiverOptions();
+    options.customNamespaces = { [NAMESPACE]: global.cast.framework.system.MessageType.JSON };
+    // This receiver streams raw MSE video over its own namespace and never loads a CAF
+    // media session, so CAF's default no-media idle shutdown (~300s) must be disabled here.
+    options.disableIdleTimeout = true;
+    lifecycleDiagnostics.optionsSnapshot(options);
+    lifecycleDiagnostics.record("receiver_caf_start_requested");
+    context.start(options);
+    lifecycleDiagnostics.record("receiver_caf_start_returned");
+
+  }
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
+  if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
+})(globalThis);
