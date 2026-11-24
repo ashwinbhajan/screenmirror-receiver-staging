@@ -105,9 +105,28 @@
   function clearConnectedWithoutStartTimer() {
     if (connectedWithoutStartTimer !== null) { global.clearTimeout(connectedWithoutStartTimer); connectedWithoutStartTimer = null; }
   }
-  function setStallBadge(visible) {
-    try { const badge = document.getElementById("stall-badge"); if (badge) badge.hidden = !visible; } catch (_) {}
+  // One corner badge over the frozen picture: "Reconnecting…" for a stall,
+  // "Paused on your iPhone" while iOS has paused screen sharing.
+  let badgeKind = null;
+  function setBadge(kind) {
+    badgeKind = kind;
+    try {
+      const badge = document.getElementById("stall-badge");
+      const text = document.getElementById("stall-badge-text");
+      if (!badge) return;
+      badge.hidden = !kind;
+      badge.classList.toggle("paused", kind === "paused");
+      if (text && kind) text.textContent = kind === "paused" ? "Paused on your iPhone" : "Reconnecting…";
+    } catch (_) {}
   }
+  function setStallBadge(visible) {
+    if (visible) { if (badgeKind !== "paused") setBadge("stall"); }
+    else if (badgeKind === "stall") setBadge(null);
+  }
+  // Features this TV app offers the iPhone on the media connection. Older
+  // iPhone apps ignore the extra key; newer ones only send the matching
+  // messages after seeing it, so neither side ever gets an unknown message.
+  const MEDIA_FEATURES = Object.freeze(["senderPause"]);
   // No phone connected while idle: return the TV to its home screen instead of
   // keeping the receiver alive (and possibly hidden behind another TV app).
   function cancelNoSenderTimer() {
@@ -616,6 +635,7 @@
     let lastAppendAtMs = null; let lastRenderAtMs = null; let renderedMediaTime = NaN;
     let decodeDuration = NaN; let displayLead = NaN; let receiverDrops = 0;
     let seekCount = 0; let lastSeekKind = 0; let rateChanges = 0;
+    let senderPaused = false; let pendingLiveJump = false;
     let source; let buffer; let audioBuffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingFragment = null; let lastAppendingSyncTimes = []; const syncPoints = []; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let healthySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let lastAudioType = 0; let audioTrimPending = false; let audioCreditSequence = 0; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
     if (activeReceiverPagehideListener && typeof global.removeEventListener === "function") {
       global.removeEventListener("pagehide", activeReceiverPagehideListener);
@@ -705,17 +725,17 @@
     };
     const installFrameObserver = () => {
       if (typeof video.requestVideoFrameCallback === "function") {
-        sendLatency({ type: "latencyCapability", mode: "requestVideoFrameCallback" });
+        sendLatency({ type: "latencyCapability", mode: "requestVideoFrameCallback", features: MEDIA_FEATURES });
         const next = (now, metadata) => { if (receiverStopped) return; observeFrame(now, metadata); frameCallbackID = video.requestVideoFrameCallback(next); };
         frameCallbackID = video.requestVideoFrameCallback(next);
-      } else { latencyFallback = true; sendLatency({ type: "latencyCapability", mode: "playbackAckFallback" }); }
+      } else { latencyFallback = true; sendLatency({ type: "latencyCapability", mode: "playbackAckFallback", features: MEDIA_FEATURES }); }
     };
     const clearInitAppendTimeout = () => { if (initAppendTimeout) { global.clearTimeout(initAppendTimeout); initAppendTimeout = undefined; } };
     const clearPlayTimeout = () => { if (playTimeout) { global.clearTimeout(playTimeout); playTimeout = undefined; } };
     const clearRecoveryTimeout = () => { if (lastPlayback.recoveryTimeout) { global.clearTimeout(lastPlayback.recoveryTimeout); lastPlayback.recoveryTimeout = undefined; } };
     const clearReconnectingScreenTimer = () => { if (reconnectingScreenTimer) { global.clearTimeout(reconnectingScreenTimer); reconnectingScreenTimer = undefined; } };
     const scheduleReconnectingScreen = () => {
-      if (receiverStopped || !firstRendered || reconnectingScreenTimer) return;
+      if (receiverStopped || !firstRendered || reconnectingScreenTimer || senderPaused) return;
       reconnectingScreenTimer = global.setTimeout(() => {
         reconnectingScreenTimer = undefined;
         if (!shouldShowReconnectingScreen(firstRendered, receiverStopped, lastPlayback.advancedAt, performance.now(), stallThresholdMs)) return;
@@ -897,8 +917,23 @@
         sendMediaResult(event.senderId, request.requestId, "receiver_unexpected_pause_resume_failed");
       }
     };
+    // After the iPhone resumes, the TV holds old video up to the pause and new
+    // video after it. Jump straight to the newest video instead of catching up.
+    const jumpToLiveAfterResume = () => {
+      if (!pendingLiveJump || receiverStopped || recoverySeekPending || !video.buffered || !video.buffered.length) return;
+      const last = video.buffered.length - 1;
+      const start = video.buffered.start(last); const end = video.buffered.end(last);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
+      if (video.currentTime >= start && end - video.currentTime < 1) { pendingLiveJump = false; return; }
+      if (video.currentTime >= start) return;
+      pendingLiveJump = false;
+      recoverySeekPending = true;
+      seekCount += 1; lastSeekKind = 5;
+      sendMediaResult(event.senderId, request.requestId, "receiver_resume_live_jump");
+      try { video.currentTime = Math.max(start + 0.05, end - 0.05); } catch (_) { recoverySeekPending = false; }
+    };
     const detectPlaybackStall = () => {
-      if (video.paused && !video.ended) { resumeUnexpectedPause(); return; }
+      if (video.paused && !video.ended) { if (!senderPaused) resumeUnexpectedPause(); return; }
       if (!initialSeekCompleted || recoverySeekPending || !firstRendered || video.paused || video.ended || !video.buffered || !video.buffered.length) return;
       const start = video.buffered.start(0); const end = video.buffered.end(video.buffered.length - 1);
       if (!Number.isFinite(start) || !Number.isFinite(end) || end - video.currentTime < recoveryMinimumLeadSeconds) return;
@@ -1129,6 +1164,7 @@
             }
             ensurePlayablePosition();
             attemptPlay();
+            jumpToLiveAfterResume();
             recoverPlaybackPosition();
             detectPlaybackStall();
             catchUpHealthyPlayback();
@@ -1189,6 +1225,23 @@
                 initialAudioCredits.authenticated();
                 sendReceiverDiagnostic(event, request, "receiver_auth_validation_passed");
                 sendReceiverDiagnostic(event, request, "receiver_endpoint_fetch_succeeded");
+                return;
+              }
+              if ((control.type === "senderPaused" || control.type === "senderResumed")
+                  && control.protocolVersion === PROTOCOL_VERSION && Object.keys(control).length === 2) {
+                if (control.type === "senderPaused") {
+                  senderPaused = true;
+                  clearReconnectingScreenTimer();
+                  setBadge("paused");
+                  if (!receiverStopped && ui && !ui.panel.hidden && currentScreen === "reconnecting") showScreen("playing");
+                  sendMediaResult(event.senderId, request.requestId, "receiver_sender_paused_shown");
+                } else {
+                  senderPaused = false;
+                  setBadge(null);
+                  pendingLiveJump = true;
+                  lastPlayback.advancedAt = performance.now();
+                  sendMediaResult(event.senderId, request.requestId, "receiver_sender_resumed");
+                }
                 return;
               }
               if (control.type === "normalStop" && control.protocolVersion === PROTOCOL_VERSION && Object.keys(control).length === 2) {
@@ -1715,6 +1768,7 @@
       const preview = new URLSearchParams(global.location && global.location.search).get("preview");
       if (preview && SCREEN_COPY[preview]) { showScreen(preview); cancelIdleReturnToHomeTimer(); return; }
       if (preview === "stall") { showScreen("ready"); ui.panel.hidden = true; setStallBadge(true); return; }
+      if (preview === "paused") { showScreen("ready"); ui.panel.hidden = true; setBadge("paused"); return; }
     } catch (_) {}
     showScreen("ready");
     const video = document.getElementById("probe-video");
@@ -1774,6 +1828,6 @@
     lifecycleDiagnostics.record("receiver_caf_start_returned");
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, SCREEN_SHOWS_PHONE_CHIP, SCREEN_SHOWS_STEPS, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MEDIA_FEATURES, effectiveReceiverConfigHash, SCREEN_COPY, SCREEN_SHOWS_PHONE_CHIP, SCREEN_SHOWS_STEPS, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);

@@ -837,3 +837,14 @@ test("TV screens keep the acceptance titles and add the unreachable screen", () 
     assert.doesNotMatch(`${title} ${detail}`, /CMAF|debug|revision|fragment|namespace|transport|socket|receiver/i);
   }
 });
+
+test("pause signal is negotiated and strictly shaped", () => {
+  const gate = receiver();
+  assert.deepEqual(Array.from(gate.MEDIA_FEATURES), ["senderPause"]);
+  const source = fs.readFileSync(receiverSourcePath, "utf8");
+  assert.match(source, /control\.type === "senderPaused" \|\| control\.type === "senderResumed"\)\s*\n\s*&& control\.protocolVersion === PROTOCOL_VERSION && Object\.keys\(control\)\.length === 2/);
+  assert.match(source, /type: "latencyCapability", mode: "requestVideoFrameCallback", features: MEDIA_FEATURES/);
+  assert.match(source, /type: "latencyCapability", mode: "playbackAckFallback", features: MEDIA_FEATURES/);
+  // Unknown controls still end the session exactly as before.
+  assert.match(source, /stop\("protocol_error"\); return;\n\s*\}/);
+});
