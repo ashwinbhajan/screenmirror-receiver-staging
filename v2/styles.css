@@ -36,3 +36,4 @@ body.media-active #probe-video { background: #000; display: block; height: 100vh
 .status-steps li { display: flex; align-items: center; gap: 12px; max-width: 18em; text-align: left; line-height: 1.35; }
 .status-steps li span { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 2em; height: 2em; border-radius: 50%; background: rgba(168, 201, 242, .16); color: #e7eefb; }
 @media (prefers-reduced-motion: reduce) { .status-content, .screen-enter { animation: none; } }
+.casting-visual { width: clamp(150px, 15vw, 300px); margin-bottom: 2.6vh; }
