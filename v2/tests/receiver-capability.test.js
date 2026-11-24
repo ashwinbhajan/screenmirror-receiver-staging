@@ -820,8 +820,9 @@ test("no screen can be stuck: calm stall stages and idle timeouts are bounded", 
   assert.ok(gate.STALL_GIVE_UP_AFTER_MS <= 30000);
   assert.ok(gate.CONNECTED_WITHOUT_START_MS <= 30000);
   assert.ok(gate.NO_SENDER_RETURN_TO_HOME_MS <= 120000);
-  assert.ok(gate.IDLE_RETURN_TO_HOME_STATES.includes("stalledLost"));
-  assert.deepEqual(Array.from(gate.SCREEN_COPY.stalledLost), ["Connection Lost", "Tap Cast to TV on your iPhone to start again."]);
+  // A locked iPhone keeps its connection: the TV must wait, never close the app.
+  assert.ok(!gate.IDLE_RETURN_TO_HOME_STATES.includes("stalledLost"));
+  assert.equal(gate.SCREEN_COPY.stalledLost[0], "Waiting for Your iPhone");
   assert.deepEqual(Array.from(gate.SCREEN_COPY.waitingForStart), ["Ready to Cast", "Your iPhone is connected. Tap Start Casting in the app."]);
 });
 

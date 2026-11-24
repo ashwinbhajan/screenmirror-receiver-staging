@@ -81,7 +81,10 @@
     // Phone connected but never started: do not leave "Starting your cast…" up.
     waitingForStart: Object.freeze(["Ready to Cast", "Your iPhone is connected. Tap Start Casting in the app."]),
     // Picture stuck long after a stall: never sit on "Reconnecting" forever.
-    stalledLost: Object.freeze(["Connection Lost", "Tap Cast to TV on your iPhone to start again."]),
+    // Media connection still open but no new picture for 30 s — most often the
+    // iPhone was locked or its screen went off. Not a lost connection, so the TV
+    // keeps waiting (a real loss closes the connection and shows "Connection Lost").
+    stalledLost: Object.freeze(["Waiting for Your iPhone", "Unlock your iPhone to continue. If it doesn’t come back, tap Cast to TV again."]),
     // The TV never reached the iPhone (first picture never arrived): almost always
     // a network that keeps devices apart (guest/office Wi‑Fi, VPN, different band).
     unreachable: Object.freeze(["Can’t Reach Your iPhone", "Your iPhone and TV need to be on the same Wi‑Fi. Guest and office networks often block this."])
@@ -98,7 +101,9 @@
   // Only "stopped" and "lost" count as genuinely idle for the return-to-home
   // timer — "ready" is first launch (still mid-setup) and "reconnecting" is
   // an in-progress recovery, neither of which should be cut short.
-  const IDLE_RETURN_TO_HOME_STATES = Object.freeze(["stopped", "lost", "stalledLost", "unreachable"]);
+  // "stalledLost" is deliberately excluded: the iPhone is still connected
+  // (e.g. locked), so the TV must not close the app underneath it.
+  const IDLE_RETURN_TO_HOME_STATES = Object.freeze(["stopped", "lost", "unreachable"]);
   let currentScreen = "ready";
   let connectedWithoutStartTimer = null;
   let noSenderTimer = null;
