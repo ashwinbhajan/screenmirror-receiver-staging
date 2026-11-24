@@ -558,7 +558,7 @@ for (const ending of ["normal", "normalStop", "progressWithoutPlayingEvent", "pa
   context.URL = class extends URL { static createObjectURL() { return "blob:test"; } };
   vm.runInNewContext(fs.readFileSync(receiverSourcePath, "utf8"), context);
   assert.equal(nodes["status-title"].textContent, "Ready to Cast");
-  assert.equal(nodes["status-detail"].textContent, "Open the app on your iPhone to begin.");
+  assert.equal(nodes["status-detail"].textContent, "On your iPhone, open Screen Mirror and tap Cast to TV.");
   assert.ok(classes.has("receiver-waiting"));
   now = 4; systemEvents.ready();
   now = 7; systemEvents.sender_connected({ senderId: "sender" });
@@ -620,7 +620,7 @@ for (const ending of ["normal", "normalStop", "progressWithoutPlayingEvent", "pa
   assert.equal(nodes["stall-badge"].hidden, false, "a short stall shows the corner badge");
   runPendingTimer();
   assert.equal(nodes["status-title"].textContent, "Reconnecting…");
-  assert.equal(nodes["status-detail"].textContent, "Keep the app open on your iPhone.");
+  assert.equal(nodes["status-detail"].textContent, "Keep Screen Mirror open on your iPhone.");
   assert.equal(nodes["idle-screen"].hidden, false);
   assert.ok(classes.has("receiver-waiting"));
   if (ending !== "progressWithoutPlayingEvent" && ending !== "pausedFrameDoesNotHide") videoEvents.playing();
@@ -645,7 +645,7 @@ for (const ending of ["normal", "normalStop", "progressWithoutPlayingEvent", "pa
   assert.equal(classes.has("receiver-waiting"), false);
   assert.equal(nodes["idle-screen"].hidden, false);
   assert.equal(nodes["status-title"].textContent, stopped ? "Casting Stopped" : "Connection Lost");
-  assert.equal(nodes["status-detail"].textContent, stopped ? "Ready when you are. Start casting again from your iPhone." : "We’re waiting for your iPhone. Check Wi‑Fi and start casting again.");
+  assert.equal(nodes["status-detail"].textContent, stopped ? "Tap Cast to TV on your iPhone to start again." : "Check that your iPhone and TV are on the same Wi‑Fi, then tap Cast to TV again.");
   assert.equal(messages.filter((value) => value.result === "receiver_stop_received").length, 1);
   assert.equal(messages.filter((value) => value.result === "receiver_idle_screen_shown").length, 1);
   assert.equal(messages.filter((value) => value.result === "receiver_casting_stopped_screen_shown").length, stopped ? 1 : 0);
@@ -821,6 +821,19 @@ test("no screen can be stuck: calm stall stages and idle timeouts are bounded", 
   assert.ok(gate.CONNECTED_WITHOUT_START_MS <= 30000);
   assert.ok(gate.NO_SENDER_RETURN_TO_HOME_MS <= 120000);
   assert.ok(gate.IDLE_RETURN_TO_HOME_STATES.includes("stalledLost"));
-  assert.deepEqual(Array.from(gate.SCREEN_COPY.stalledLost), ["Connection Lost", "Start casting again from your iPhone."]);
-  assert.deepEqual(Array.from(gate.SCREEN_COPY.waitingForStart), ["Ready to Cast", "Tap Start Casting on your iPhone."]);
+  assert.deepEqual(Array.from(gate.SCREEN_COPY.stalledLost), ["Connection Lost", "Tap Cast to TV on your iPhone to start again."]);
+  assert.deepEqual(Array.from(gate.SCREEN_COPY.waitingForStart), ["Ready to Cast", "Your iPhone is connected. Tap Start Casting in the app."]);
+});
+
+test("TV screens keep the acceptance titles and add the unreachable screen", () => {
+  const gate = receiver();
+  assert.equal(gate.SCREEN_COPY.ready[0], "Ready to Cast");
+  assert.equal(gate.SCREEN_COPY.stopped[0], "Casting Stopped");
+  assert.equal(gate.SCREEN_COPY.lost[0], "Connection Lost");
+  assert.ok(gate.SCREEN_COPY.unreachable[1].includes("same Wi"));
+  assert.ok(gate.SCREEN_SHOWS_STEPS.includes("ready"));
+  assert.ok(gate.SCREEN_SHOWS_PHONE_CHIP.includes("connected"));
+  for (const [title, detail] of Object.values(gate.SCREEN_COPY)) {
+    assert.doesNotMatch(`${title} ${detail}`, /CMAF|debug|revision|fragment|namespace|transport|socket|receiver/i);
+  }
 });

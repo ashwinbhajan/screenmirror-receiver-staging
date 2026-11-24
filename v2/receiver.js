@@ -71,16 +71,24 @@
   function byteLength(value) { return new TextEncoder().encode(value).length; }
   function safeObject(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
   const SCREEN_COPY = Object.freeze({
-    ready: Object.freeze(["Ready to Cast", "Open the app on your iPhone to begin."]),
+    // Titles "Ready to Cast", "Casting Stopped" and "Connection Lost" are part of the
+    // Start/Stop acceptance contract (AGENTS.md) and stay exactly as they are.
+    ready: Object.freeze(["Ready to Cast", "On your iPhone, open Screen Mirror and tap Cast to TV."]),
     connected: Object.freeze(["Connected", "Starting your cast…"]),
-    stopped: Object.freeze(["Casting Stopped", "Ready when you are. Start casting again from your iPhone."]),
-    lost: Object.freeze(["Connection Lost", "We’re waiting for your iPhone. Check Wi‑Fi and start casting again."]),
-    reconnecting: Object.freeze(["Reconnecting…", "Keep the app open on your iPhone."]),
+    stopped: Object.freeze(["Casting Stopped", "Tap Cast to TV on your iPhone to start again."]),
+    lost: Object.freeze(["Connection Lost", "Check that your iPhone and TV are on the same Wi‑Fi, then tap Cast to TV again."]),
+    reconnecting: Object.freeze(["Reconnecting…", "Keep Screen Mirror open on your iPhone."]),
     // Phone connected but never started: do not leave "Starting your cast…" up.
-    waitingForStart: Object.freeze(["Ready to Cast", "Tap Start Casting on your iPhone."]),
+    waitingForStart: Object.freeze(["Ready to Cast", "Your iPhone is connected. Tap Start Casting in the app."]),
     // Picture stuck long after a stall: never sit on "Reconnecting" forever.
-    stalledLost: Object.freeze(["Connection Lost", "Start casting again from your iPhone."])
+    stalledLost: Object.freeze(["Connection Lost", "Tap Cast to TV on your iPhone to start again."]),
+    // The TV never reached the iPhone (first picture never arrived): almost always
+    // a network that keeps devices apart (guest/office Wi‑Fi, VPN, different band).
+    unreachable: Object.freeze(["Can’t Reach Your iPhone", "Your iPhone and TV need to be on the same Wi‑Fi. Guest and office networks often block this."])
   });
+  // Small "iPhone connected" chip and the how-to steps, per screen.
+  const SCREEN_SHOWS_PHONE_CHIP = Object.freeze(["connected", "waitingForStart", "reconnecting"]);
+  const SCREEN_SHOWS_STEPS = Object.freeze(["ready", "unreachable"]);
   // Calm-stall timings (2026-11-25): a short hiccup keeps the last picture
   // with a small corner badge; the full panel appears only if it persists.
   const STALL_FULL_SCREEN_AFTER_MS = 6000;
@@ -90,7 +98,7 @@
   // Only "stopped" and "lost" count as genuinely idle for the return-to-home
   // timer — "ready" is first launch (still mid-setup) and "reconnecting" is
   // an in-progress recovery, neither of which should be cut short.
-  const IDLE_RETURN_TO_HOME_STATES = Object.freeze(["stopped", "lost", "stalledLost"]);
+  const IDLE_RETURN_TO_HOME_STATES = Object.freeze(["stopped", "lost", "stalledLost", "unreachable"]);
   let currentScreen = "ready";
   let connectedWithoutStartTimer = null;
   let noSenderTimer = null;
@@ -144,6 +152,16 @@
     document.body.classList.remove("receiver-waiting");
     if (state === "ready" || state === "reconnecting") document.body.classList.add("receiver-waiting");
     if (copy) { ui.title.textContent = copy[0]; ui.detail.textContent = copy[1]; }
+    try {
+      if (ui.chip) ui.chip.hidden = !SCREEN_SHOWS_PHONE_CHIP.includes(state);
+      if (ui.steps) ui.steps.hidden = !SCREEN_SHOWS_STEPS.includes(state);
+      // Restart the soft fade so screen changes never flash.
+      if (ui.content && ui.content.classList) {
+        ui.content.classList.remove("screen-enter");
+        void ui.content.offsetWidth;
+        ui.content.classList.add("screen-enter");
+      }
+    } catch (_) {}
   }
   function closeScreen(event, failed) {
     return !failed && event && event.code === 1000 && event.wasClean === true ? "stopped" : "lost";
@@ -758,7 +776,7 @@
       sendMediaResult(event.senderId, request.requestId, "receiver_video_cleared");
       sendMediaResult(event.senderId, request.requestId, "receiver_idle_screen_shown");
       if (screen === "stopped") sendMediaResult(event.senderId, request.requestId, "receiver_casting_stopped_screen_shown");
-      if (screen === "lost") sendMediaResult(event.senderId, request.requestId, "receiver_connection_lost_screen_shown");
+      if (screen === "lost" || screen === "unreachable") sendMediaResult(event.senderId, request.requestId, "receiver_connection_lost_screen_shown");
     };
     const stop = (result) => { clearInitAppendTimeout(); clearPlayTimeout(); clearPlaybackSampleTimer(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
     const safePlayRejection = (error) => {
@@ -1229,7 +1247,7 @@
             initialAudioCredits.close();
             if (!receiverStopped) {
               sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
-              clearVideoForReceiverStop(closeScreen(closeEvent, socketFailed));
+              clearVideoForReceiverStop(!firstRendered && socketFailed ? "unreachable" : closeScreen(closeEvent, socketFailed));
             }
             if (!firstRendered) {
               const code = closeEvent && Number.isInteger(closeEvent.code) ? closeEvent.code : 0;
@@ -1689,7 +1707,15 @@
     diagnosticVersion: lifecycleDiagnostics.diagnosticVersion, snapshot: () => lifecycleDiagnostics.snapshot() }); } catch (_) {}
 
   function boot() {
-    ui = { panel: document.getElementById("idle-screen"), title: document.getElementById("status-title"), detail: document.getElementById("status-detail") };
+    ui = { panel: document.getElementById("idle-screen"), title: document.getElementById("status-title"), detail: document.getElementById("status-detail"),
+      chip: document.getElementById("phone-chip"), steps: document.getElementById("status-steps"), content: document.getElementById("status-content") };
+    // Design preview: receiver.html?preview=<screen> renders one screen without
+    // Google Cast (for reviewing TV screens in a browser). No effect on TVs.
+    try {
+      const preview = new URLSearchParams(global.location && global.location.search).get("preview");
+      if (preview && SCREEN_COPY[preview]) { showScreen(preview); cancelIdleReturnToHomeTimer(); return; }
+      if (preview === "stall") { showScreen("ready"); ui.panel.hidden = true; setStallBadge(true); return; }
+    } catch (_) {}
     showScreen("ready");
     const video = document.getElementById("probe-video");
     capabilityReadyPromise = testCapabilities(video);
@@ -1748,6 +1774,6 @@
     lifecycleDiagnostics.record("receiver_caf_start_returned");
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, SCREEN_SHOWS_PHONE_CHIP, SCREEN_SHOWS_STEPS, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
