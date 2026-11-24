@@ -75,12 +75,47 @@
     connected: Object.freeze(["Connected", "Starting your cast…"]),
     stopped: Object.freeze(["Casting Stopped", "Ready when you are. Start casting again from your iPhone."]),
     lost: Object.freeze(["Connection Lost", "We’re waiting for your iPhone. Check Wi‑Fi and start casting again."]),
-    reconnecting: Object.freeze(["Reconnecting…", "Keep the app open on your iPhone."])
+    reconnecting: Object.freeze(["Reconnecting…", "Keep the app open on your iPhone."]),
+    // Phone connected but never started: do not leave "Starting your cast…" up.
+    waitingForStart: Object.freeze(["Ready to Cast", "Tap Start Casting on your iPhone."]),
+    // Picture stuck long after a stall: never sit on "Reconnecting" forever.
+    stalledLost: Object.freeze(["Connection Lost", "Start casting again from your iPhone."])
   });
+  // Calm-stall timings (2026-11-25): a short hiccup keeps the last picture
+  // with a small corner badge; the full panel appears only if it persists.
+  const STALL_FULL_SCREEN_AFTER_MS = 6000;
+  const STALL_GIVE_UP_AFTER_MS = 30000;
+  const CONNECTED_WITHOUT_START_MS = 20000;
+  const NO_SENDER_RETURN_TO_HOME_MS = 90000;
   // Only "stopped" and "lost" count as genuinely idle for the return-to-home
   // timer — "ready" is first launch (still mid-setup) and "reconnecting" is
   // an in-progress recovery, neither of which should be cut short.
-  const IDLE_RETURN_TO_HOME_STATES = Object.freeze(["stopped", "lost"]);
+  const IDLE_RETURN_TO_HOME_STATES = Object.freeze(["stopped", "lost", "stalledLost"]);
+  let currentScreen = "ready";
+  let connectedWithoutStartTimer = null;
+  let noSenderTimer = null;
+  function clearConnectedWithoutStartTimer() {
+    if (connectedWithoutStartTimer !== null) { global.clearTimeout(connectedWithoutStartTimer); connectedWithoutStartTimer = null; }
+  }
+  function setStallBadge(visible) {
+    try { const badge = document.getElementById("stall-badge"); if (badge) badge.hidden = !visible; } catch (_) {}
+  }
+  // No phone connected while idle: return the TV to its home screen instead of
+  // keeping the receiver alive (and possibly hidden behind another TV app).
+  function cancelNoSenderTimer() {
+    if (noSenderTimer !== null) { global.clearTimeout(noSenderTimer); noSenderTimer = null; }
+  }
+  function scheduleNoSenderReturnToHome() {
+    cancelNoSenderTimer();
+    noSenderTimer = global.setTimeout(() => {
+      noSenderTimer = null;
+      let senders = 1;
+      try { senders = context && typeof context.getSenders === "function" ? context.getSenders().length : 1; } catch (_) {}
+      if (senders === 0 && currentScreen !== "playing") {
+        try { if (context && typeof context.stop === "function") context.stop(); } catch (_) {}
+      }
+    }, NO_SENDER_RETURN_TO_HOME_MS);
+  }
   let idleReturnToHomeTimer = null;
   function cancelIdleReturnToHomeTimer() {
     if (idleReturnToHomeTimer === null) return;
@@ -97,6 +132,9 @@
     }, IDLE_RETURN_TO_HOME_MS);
   }
   function showScreen(state) {
+    currentScreen = state;
+    if (state !== "connected") clearConnectedWithoutStartTimer();
+    if (state === "playing" || state === "stopped" || state === "lost" || state === "stalledLost") setStallBadge(false);
     receiverReadinessState = receiverReadinessStateForScreen(state);
     if (IDLE_RETURN_TO_HOME_STATES.includes(state)) scheduleIdleReturnToHomeTimer();
     else cancelIdleReturnToHomeTimer();
@@ -662,7 +700,24 @@
       if (receiverStopped || !firstRendered || reconnectingScreenTimer) return;
       reconnectingScreenTimer = global.setTimeout(() => {
         reconnectingScreenTimer = undefined;
-        if (shouldShowReconnectingScreen(firstRendered, receiverStopped, lastPlayback.advancedAt, performance.now(), stallThresholdMs)) showScreen("reconnecting");
+        if (!shouldShowReconnectingScreen(firstRendered, receiverStopped, lastPlayback.advancedAt, performance.now(), stallThresholdMs)) return;
+        // Stage 1: keep the frozen picture, show a small corner badge.
+        setStallBadge(true);
+        sendMediaResult(event.senderId, request.requestId, "receiver_stall_badge_shown");
+        const stalledSince = lastPlayback.advancedAt;
+        reconnectingScreenTimer = global.setTimeout(() => {
+          reconnectingScreenTimer = undefined;
+          if (receiverStopped || lastPlayback.advancedAt !== stalledSince) return;
+          // Stage 2: still stuck — full "Reconnecting…" panel.
+          showScreen("reconnecting");
+          reconnectingScreenTimer = global.setTimeout(() => {
+            reconnectingScreenTimer = undefined;
+            if (receiverStopped || lastPlayback.advancedAt !== stalledSince) return;
+            // Stage 3: give a clear next step; resumes by itself if media returns.
+            showScreen("stalledLost");
+            sendMediaResult(event.senderId, request.requestId, "receiver_stall_gave_up");
+          }, STALL_GIVE_UP_AFTER_MS - STALL_FULL_SCREEN_AFTER_MS);
+        }, STALL_FULL_SCREEN_AFTER_MS);
       }, stallThresholdMs);
     };
     const clearVideoForReceiverStop = (screen) => {
@@ -1224,6 +1279,7 @@
       });
       video.addEventListener("playing", () => {
         clearReconnectingScreenTimer();
+        setStallBadge(false);
         if (!receiverStopped && !ui.panel.hidden) showScreen("playing");
         sendMediaResult(event.senderId, request.requestId, "media_event_playing");
       });
@@ -1232,6 +1288,12 @@
         if (video.currentTime > lastPlayback.time + 0.01) {
           lastPlayback.time = video.currentTime;
           lastPlayback.advancedAt = performance.now();
+          // Picture is moving again: drop any stall badge or stalled panel.
+          setStallBadge(false);
+          if (!receiverStopped && ui && !ui.panel.hidden && (currentScreen === "reconnecting" || currentScreen === "stalledLost")) {
+            clearReconnectingScreenTimer();
+            showScreen("playing");
+          }
           if (lastPlayback.recoveryAwaitingProgress) {
             lastPlayback.recoveryAwaitingProgress = false;
             clearRecoveryTimeout();
@@ -1646,7 +1708,20 @@
         // identical to nothing happening. Only show it while still idle —
         // never interrupt an already-playing cast or override a more
         // specific in-progress state.
-        if (receiverReadinessState !== "mirroring" && ui && ui.panel.hidden === false) showScreen("connected");
+        cancelNoSenderTimer();
+        if (receiverReadinessState !== "mirroring" && ui && ui.panel.hidden === false) {
+          showScreen("connected");
+          clearConnectedWithoutStartTimer();
+          connectedWithoutStartTimer = global.setTimeout(() => {
+            connectedWithoutStartTimer = null;
+            if (currentScreen === "connected") showScreen("waitingForStart");
+          }, CONNECTED_WITHOUT_START_MS);
+        }
+      });
+      if (types.SENDER_DISCONNECTED) context.addEventListener(types.SENDER_DISCONNECTED, () => {
+        let senders = 1;
+        try { senders = typeof context.getSenders === "function" ? context.getSenders().length : 1; } catch (_) {}
+        if (senders === 0 && currentScreen !== "playing") scheduleNoSenderReturnToHome();
       });
     }
     try {
@@ -1673,6 +1748,6 @@
     lifecycleDiagnostics.record("receiver_caf_start_returned");
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ effectiveReceiverConfigHash, SCREEN_COPY, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);

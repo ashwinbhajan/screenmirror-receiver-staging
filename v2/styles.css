@@ -19,3 +19,8 @@ h1 { font-size: 48px; font-size: clamp(36px, 4.1vw, 80px); font-weight: 600; let
 body.media-active { background: #000; }
 body.media-active #probe-video { background: #000; display: block; height: 100vh; inset: 0; object-fit: contain; opacity: 1; position: fixed; width: 100vw; z-index: 1; }
 @media (prefers-reduced-motion: reduce) { .receiver-waiting .waiting-indicator span { animation: none; opacity: .6; } }
+.stall-badge { position: fixed; right: 4vw; bottom: 6vh; z-index: 3; display: flex; align-items: center; gap: 14px; padding: 14px 22px; border-radius: 999px; background: rgba(9, 14, 24, .78); color: #f4f6fc; font-size: clamp(18px, 1.6vw, 30px); }
+.stall-badge[hidden] { display: none; }
+.stall-spinner { width: 22px; height: 22px; border-radius: 50%; border: 3px solid rgba(168, 201, 242, .35); border-top-color: #a8c9f2; animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .stall-spinner { animation: none; } }

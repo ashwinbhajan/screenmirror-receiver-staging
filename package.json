@@ -1,0 +1,8 @@
+{
+  "name": "screenmirror-receiver-staging",
+  "private": true,
+  "scripts": {
+    "test": "node --test v2/tests/*.test.js",
+    "stamp": "node scripts/stamp-build.js"
+  }
+}
