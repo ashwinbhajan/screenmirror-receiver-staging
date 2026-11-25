@@ -131,7 +131,13 @@
   // Features this TV app offers the iPhone on the media connection. Older
   // iPhone apps ignore the extra key; newer ones only send the matching
   // messages after seeing it, so neither side ever gets an unknown message.
-  const MEDIA_FEATURES = Object.freeze(["senderPause", "mediaVisibility"]);
+  const MEDIA_FEATURES = Object.freeze(["senderPause", "mediaVisibility", "mediaReconnect"]);
+  // Wi-Fi grace: after a short network drop the TV keeps the last picture and
+  // reconnects to the same iPhone address for up to this long. Only used when
+  // the iPhone opted in (senderFeatures "reconnect"); older iPhones end the
+  // cast on a drop, so the TV must not wait for them.
+  const MEDIA_RECONNECT_GRACE_MS = 8000;
+  const MEDIA_RECONNECT_RETRY_MS = 1000;
   // Media connections whose iPhone opted in to visibility reports (it sends
   // senderFeatures only after seeing "mediaVisibility" above).
   const mediaVisibilityListeners = new Set();
@@ -618,6 +624,9 @@
       authenticated() { authenticated = true; return flush(); },
       flush,
       close() { pending = false; authenticated = false; },
+      // After a reconnect the iPhone starts a fresh audio credit flow, so the
+      // initial audioReady must be sent again on the new connection.
+      reopen(ready) { sent = false; authenticated = false; pending = !!ready; },
       get sent() { return sent; }
     };
   }
@@ -647,6 +656,7 @@
     let decodeDuration = NaN; let displayLead = NaN; let receiverDrops = 0;
     let seekCount = 0; let lastSeekKind = 0; let rateChanges = 0;
     let senderPaused = false; let pendingLiveJump = false; let mediaVisibilityHandler = null;
+    let senderReconnect = false; let mediaReconnecting = false; let mediaReconnectRetryTimer; let mediaReconnectGiveUpTimer;
     let source; let buffer; let audioBuffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingFragment = null; let lastAppendingSyncTimes = []; const syncPoints = []; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let healthySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let lastAudioType = 0; let audioTrimPending = false; let audioCreditSequence = 0; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
     if (activeReceiverPagehideListener && typeof global.removeEventListener === "function") {
       global.removeEventListener("pagehide", activeReceiverPagehideListener);
@@ -683,7 +693,7 @@
     };
     // Each runMedia call owns one receiver generation/session, so this counter
     // resets when that session is replaced while remaining monotonic in-session.
-    const emitMediaCredit = createMediaCreditEmitter(flowGeneration, sendLatency);
+    let emitMediaCredit = createMediaCreditEmitter(flowGeneration, sendLatency);
     const confirmFirstRendered = (metadata) => {
       if (!canConfirmFirstRendered(firstRendered, firstMediaAppended, metadata)) return;
       firstRendered = true;
@@ -746,7 +756,8 @@
     const clearRecoveryTimeout = () => { if (lastPlayback.recoveryTimeout) { global.clearTimeout(lastPlayback.recoveryTimeout); lastPlayback.recoveryTimeout = undefined; } };
     const clearReconnectingScreenTimer = () => { if (reconnectingScreenTimer) { global.clearTimeout(reconnectingScreenTimer); reconnectingScreenTimer = undefined; } };
     const scheduleReconnectingScreen = () => {
-      if (receiverStopped || !firstRendered || reconnectingScreenTimer || senderPaused) return;
+      // During Wi-Fi grace only the small badge shows; the grace timer decides.
+      if (receiverStopped || !firstRendered || reconnectingScreenTimer || senderPaused || mediaReconnecting) return;
       reconnectingScreenTimer = global.setTimeout(() => {
         reconnectingScreenTimer = undefined;
         if (!shouldShowReconnectingScreen(firstRendered, receiverStopped, lastPlayback.advancedAt, performance.now(), stallThresholdMs)) return;
@@ -772,6 +783,7 @@
     const clearVideoForReceiverStop = (screen) => {
       if (receiverStopped) return;
       receiverStopped = true;
+      clearMediaReconnectTimers(); mediaReconnecting = false;
       if (mediaVisibilityHandler) { mediaVisibilityListeners.delete(mediaVisibilityHandler); mediaVisibilityHandler = null; }
       healthyCatchup.close();
       healthySeekPending = false;
@@ -809,6 +821,10 @@
       sendMediaResult(event.senderId, request.requestId, "receiver_idle_screen_shown");
       if (screen === "stopped") sendMediaResult(event.senderId, request.requestId, "receiver_casting_stopped_screen_shown");
       if (screen === "lost" || screen === "unreachable") sendMediaResult(event.senderId, request.requestId, "receiver_connection_lost_screen_shown");
+    };
+    const clearMediaReconnectTimers = () => {
+      if (mediaReconnectRetryTimer) { global.clearTimeout(mediaReconnectRetryTimer); mediaReconnectRetryTimer = undefined; }
+      if (mediaReconnectGiveUpTimer) { global.clearTimeout(mediaReconnectGiveUpTimer); mediaReconnectGiveUpTimer = undefined; }
     };
     const stop = (result) => { clearInitAppendTimeout(); clearPlayTimeout(); clearPlaybackSampleTimer(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
     const safePlayRejection = (error) => {
@@ -1202,10 +1218,57 @@
             if (lastAppendingType === 2 && mediaAppendPending) sendMediaResult(event.senderId, request.requestId, "media_append_abort_event");
             stop("append_aborted");
           });
-          sendReceiverDiagnostic(event, request, "receiver_endpoint_connect_attempted");
+          // Wi-Fi grace (negotiated). A drop after the first picture keeps the
+          // frozen picture with the "Reconnecting…" badge and retries the same
+          // address; the iPhone holds the connection open for the same window.
+          const canReconnectMedia = () => senderReconnect && firstRendered && !receiverStopped
+            && !mediaReconnecting && mediaRun === activeMediaRun;
+          const giveUpMediaReconnect = () => {
+            if (!mediaReconnecting) return;
+            mediaReconnecting = false;
+            clearMediaReconnectTimers();
+            try { socket && socket.close(); } catch (_) {}
+            sendMediaResult(event.senderId, request.requestId, "receiver_media_reconnect_gave_up");
+            sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
+            clearVideoForReceiverStop("lost");
+          };
+          const scheduleMediaReconnectAttempt = () => {
+            if (!mediaReconnecting || receiverStopped) return;
+            if (mediaReconnectRetryTimer) global.clearTimeout(mediaReconnectRetryTimer);
+            mediaReconnectRetryTimer = global.setTimeout(() => {
+              mediaReconnectRetryTimer = undefined;
+              if (mediaReconnecting && !receiverStopped) openMediaSocket(true);
+            }, MEDIA_RECONNECT_RETRY_MS);
+          };
+          const beginMediaReconnect = () => {
+            mediaReconnecting = true;
+            // Old-connection data and credits are void; the iPhone restarts both.
+            pending.length = 0; audioPending.length = 0;
+            mediaReadySent = false;
+            clearReconnectingScreenTimer();
+            setStallBadge(true);
+            sendMediaResult(event.senderId, request.requestId, "receiver_media_reconnect_started");
+            mediaReconnectGiveUpTimer = global.setTimeout(giveUpMediaReconnect, MEDIA_RECONNECT_GRACE_MS);
+            scheduleMediaReconnectAttempt();
+          };
+          const finishMediaReconnect = () => {
+            mediaReconnecting = false;
+            clearMediaReconnectTimers();
+            emitMediaCredit = createMediaCreditEmitter(flowGeneration, sendLatency);
+            audioCreditSequence = 0;
+            initialAudioCredits.reopen(!!audioBuffer);
+            // New video starts after a gap: jump to it instead of waiting.
+            pendingLiveJump = true;
+            lastPlayback.advancedAt = performance.now();
+            sendMediaResult(event.senderId, request.requestId, "receiver_media_reconnected");
+          };
+          const openMediaSocket = (isReconnect) => {
+          sendReceiverDiagnostic(event, request, isReconnect ? "receiver_media_reconnect_attempted" : "receiver_endpoint_connect_attempted");
+          let candidate;
           try {
-            socket = new global.WebSocket(request.endpoint);
+            candidate = new global.WebSocket(request.endpoint);
           } catch (constructorError) {
+            if (isReconnect) { scheduleMediaReconnectAttempt(); return; }
             // A page served over https: may have this throw synchronously
             // (mixed-content / Private Network Access rejection) before any
             // onerror/onopen ever fires, which previously left the sender
@@ -1216,22 +1279,29 @@
             stop("websocket_failed");
             return;
           }
-          socket.binaryType = "arraybuffer";
+          socket = candidate;
+          candidate.binaryType = "arraybuffer";
           let socketOpened = false;
           const socketConnectTimeout = global.setTimeout(() => {
             if (!socketOpened) sendReceiverDiagnostic(event, request, "receiver_endpoint_connect_timeout");
           }, 8000);
-          socket.onopen = () => {
+          candidate.onopen = () => {
+            if (socket !== candidate) return;
             socketOpened = true;
             global.clearTimeout(socketConnectTimeout);
-            sendReceiverDiagnostic(event, request, "receiver_endpoint_fetch_started");
-            socket.send(JSON.stringify({ type: "hello", token: new URL(request.endpoint).pathname.slice(1), protocolVersion: PROTOCOL_VERSION }));
-            installFrameObserver();
+            sendReceiverDiagnostic(event, request, isReconnect ? "receiver_media_reconnect_opened" : "receiver_endpoint_fetch_started");
+            candidate.send(JSON.stringify({ type: "hello", token: new URL(request.endpoint).pathname.slice(1), protocolVersion: PROTOCOL_VERSION }));
+            // The frame observer already runs; a new connection only needs the
+            // feature announcement again (the iPhone resets it per connection).
+            if (isReconnect) sendLatency({ type: "latencyCapability", mode: latencyFallback ? "playbackAckFallback" : "requestVideoFrameCallback", features: MEDIA_FEATURES });
+            else installFrameObserver();
           };
-          socket.onmessage = (message) => {
+          candidate.onmessage = (message) => {
+            if (socket !== candidate) return;
             if (typeof message.data === "string") {
               const control = parse(message.data); if (!control) { stop("protocol_error"); return; }
               if (control.type === "readyForMedia" && control.protocolVersion === PROTOCOL_VERSION && Object.keys(control).length === 2) {
+                if (mediaReconnecting) finishMediaReconnect();
                 mediaAuthenticated = true;
                 startPlaybackSamples();
                 initialAudioCredits.authenticated();
@@ -1241,9 +1311,13 @@
               }
               if (control.type === "senderFeatures" && control.protocolVersion === PROTOCOL_VERSION
                   && Object.keys(control).length === 3 && Array.isArray(control.features)) {
-                if (control.features.includes("visibility") && !mediaVisibilityHandler) {
-                  mediaVisibilityHandler = (visibility) => sendLatency({ type: "receiverVisibility", protocolVersion: PROTOCOL_VERSION, visibility });
-                  mediaVisibilityListeners.add(mediaVisibilityHandler);
+                if (control.features.includes("reconnect")) senderReconnect = true;
+                if (control.features.includes("visibility")) {
+                  if (!mediaVisibilityHandler) {
+                    mediaVisibilityHandler = (visibility) => sendLatency({ type: "receiverVisibility", protocolVersion: PROTOCOL_VERSION, visibility });
+                    mediaVisibilityListeners.add(mediaVisibilityHandler);
+                  }
+                  // Also after a reconnect: the iPhone resets visibility per connection.
                   mediaVisibilityHandler(currentVisibility());
                 }
                 return;
@@ -1268,7 +1342,7 @@
               if (control.type === "normalStop" && control.protocolVersion === PROTOCOL_VERSION && Object.keys(control).length === 2) {
                 sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
                 clearVideoForReceiverStop("stopped");
-                try { socket.close(1000, "normal_stop"); } catch (_) {}
+                try { candidate.close(1000, "normal_stop"); } catch (_) {}
                 return;
               }
               if (control.type === "clockPing" && Number.isFinite(control.t1) && Number.isInteger(control.sequence)) { const t2 = performance.now(); sendLatency({ type: "clockPong", sequence: control.sequence, t1: control.t1, t2, t3: performance.now() }); return; }
@@ -1306,19 +1380,25 @@
             stop("binary_envelope_invalid");
           };
           let socketFailed = false;
-          socket.onerror = () => {
+          candidate.onerror = () => {
+            if (socket !== candidate) return;
             socketFailed = true;
             global.clearTimeout(socketConnectTimeout);
+            // During Wi-Fi grace the close event that follows decides what to do.
+            if (mediaReconnecting || canReconnectMedia()) return;
             if (!firstRendered) {
               sendReceiverDiagnostic(event, request, "receiver_endpoint_fetch_failed");
               sendReceiverDiagnostic(event, request, "receiver_error_before_disconnect_websocket_error");
             }
             stop("websocket_failed");
-          }; socket.onclose = (closeEvent) => {
+          }; candidate.onclose = (closeEvent) => {
+            if (socket !== candidate) return;
             global.clearTimeout(socketConnectTimeout);
             mediaAuthenticated = false;
             clearPlaybackSampleTimer();
             initialAudioCredits.close();
+            if (mediaReconnecting) { scheduleMediaReconnectAttempt(); return; }
+            if (canReconnectMedia()) { beginMediaReconnect(); return; }
             if (!receiverStopped) {
               sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
               clearVideoForReceiverStop(!firstRendered && socketFailed ? "unreachable" : closeScreen(closeEvent, socketFailed));
@@ -1330,6 +1410,8 @@
               sendMediaResult(event.senderId, request.requestId, "websocket_closed");
             }
           };
+          };
+          openMediaSocket(false);
           sendMediaResult(event.senderId, request.requestId, "media_socket_connecting");
         } catch (_) { stop("sourcebuffer_failed"); }
       }, { once: true });
@@ -1850,6 +1932,6 @@
     lifecycleDiagnostics.record("receiver_caf_start_returned");
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MEDIA_FEATURES, effectiveReceiverConfigHash, SCREEN_COPY, SCREEN_SHOWS_PHONE_CHIP, SCREEN_SHOWS_STEPS, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MEDIA_FEATURES, MEDIA_RECONNECT_GRACE_MS, MEDIA_RECONNECT_RETRY_MS, effectiveReceiverConfigHash, SCREEN_COPY, SCREEN_SHOWS_PHONE_CHIP, SCREEN_SHOWS_STEPS, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);

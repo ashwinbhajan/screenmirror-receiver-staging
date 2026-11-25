@@ -841,7 +841,7 @@ test("TV screens keep the acceptance titles and add the unreachable screen", () 
 
 test("pause signal is negotiated and strictly shaped", () => {
   const gate = receiver();
-  assert.deepEqual(Array.from(gate.MEDIA_FEATURES), ["senderPause", "mediaVisibility"]);
+  assert.deepEqual(Array.from(gate.MEDIA_FEATURES), ["senderPause", "mediaVisibility", "mediaReconnect"]);
   const source = fs.readFileSync(receiverSourcePath, "utf8");
   assert.match(source, /control\.type === "senderPaused" \|\| control\.type === "senderResumed"\)\s*\n\s*&& control\.protocolVersion === PROTOCOL_VERSION && Object\.keys\(control\)\.length === 2/);
   assert.match(source, /type: "latencyCapability", mode: "requestVideoFrameCallback", features: MEDIA_FEATURES/);
@@ -854,4 +854,43 @@ test("media-connection visibility is opt-in by the iPhone", () => {
   const source = fs.readFileSync(receiverSourcePath, "utf8");
   assert.match(source, /control\.type === "senderFeatures" && control\.protocolVersion === PROTOCOL_VERSION\s*\n\s*&& Object\.keys\(control\)\.length === 3/);
   assert.match(source, /type: "receiverVisibility", protocolVersion: PROTOCOL_VERSION, visibility/);
+});
+
+test("Wi-Fi grace is opt-in by the iPhone and bounded to 8 seconds", () => {
+  const gate = receiver();
+  assert.equal(gate.MEDIA_RECONNECT_GRACE_MS, 8000);
+  assert.ok(gate.MEDIA_RECONNECT_RETRY_MS > 0 && gate.MEDIA_RECONNECT_RETRY_MS < gate.MEDIA_RECONNECT_GRACE_MS);
+  const source = fs.readFileSync(receiverSourcePath, "utf8");
+  // Only an iPhone that announced "reconnect" ever gets a grace window.
+  assert.match(source, /if \(control\.features\.includes\("reconnect"\)\) senderReconnect = true;/);
+  assert.match(source, /const canReconnectMedia = \(\) => senderReconnect && firstRendered && !receiverStopped/);
+  // Normal Stop marks the receiver stopped first, so it can never start a grace window.
+  assert.match(source, /clearVideoForReceiverStop\("stopped"\);\n\s*try \{ candidate\.close\(1000, "normal_stop"\); \} catch/);
+  // Giving up ends on the existing "Connection Lost" screen.
+  assert.match(source, /receiver_media_reconnect_gave_up[\s\S]{0,200}clearVideoForReceiverStop\("lost"\)/);
+  // Callbacks from a replaced connection are ignored.
+  for (const handler of ["onopen", "onmessage", "onerror", "onclose"]) {
+    assert.match(source, new RegExp(`candidate\\.${handler} = \\([^)]*\\) => \\{\\n\\s*if \\(socket !== candidate\\) return;`));
+  }
+  // A reconnect restarts the credit flows the iPhone resets per connection.
+  assert.match(source, /const finishMediaReconnect = \(\) => \{[\s\S]{0,300}emitMediaCredit = createMediaCreditEmitter\(flowGeneration, sendLatency\);[\s\S]{0,80}audioCreditSequence = 0;[\s\S]{0,80}initialAudioCredits\.reopen/);
+  assert.match(source, /const beginMediaReconnect = \(\) => \{[\s\S]{0,200}mediaReadySent = false;/);
+});
+
+test("audio initial credits can be re-sent once after a reconnect", () => {
+  const { createInitialAudioCreditDelivery } = receiver();
+  let sends = 0;
+  const delivery = createInitialAudioCreditDelivery(() => { sends += 1; return true; }, () => true);
+  delivery.ready(); delivery.authenticated();
+  assert.equal(sends, 1);
+  delivery.close();
+  delivery.reopen(true);
+  assert.equal(delivery.sent, false);
+  assert.equal(sends, 1, "nothing is sent before the new connection authenticates");
+  delivery.authenticated();
+  assert.equal(sends, 2);
+  delivery.authenticated();
+  assert.equal(sends, 2, "still exactly once per connection");
+  delivery.close(); delivery.reopen(false); delivery.authenticated();
+  assert.equal(sends, 2, "no audio buffer, no audioReady");
 });
