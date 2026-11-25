@@ -855,3 +855,80 @@ test("media-connection visibility is opt-in by the iPhone", () => {
   assert.match(source, /control\.type === "senderFeatures" && control\.protocolVersion === PROTOCOL_VERSION\s*\n\s*&& Object\.keys\(control\)\.length === 3/);
   assert.match(source, /type: "receiverVisibility", protocolVersion: PROTOCOL_VERSION, visibility/);
 });
+
+test("TV languages: every language has every text, no technical words, app names in English", () => {
+  const gate = receiver();
+  const screens = Object.keys(gate.SCREEN_COPY);
+  const languages = Object.keys(gate.SCREEN_TRANSLATIONS);
+  assert.ok(languages.length >= 10);
+  for (const language of languages) {
+    const copy = gate.SCREEN_TRANSLATIONS[language];
+    for (const screen of screens) {
+      assert.equal(copy[screen].length, 2, `${language}.${screen}`);
+      for (const text of copy[screen]) {
+        assert.ok(text.trim().length > 0, `${language}.${screen} empty`);
+        assert.doesNotMatch(text, /CMAF|debug|revision|fragment|namespace|transport|socket|receiver/i);
+      }
+    }
+    assert.equal(copy.steps.length, 3, `${language}.steps`);
+    for (const key of ["chip", "badgeStall", "badgePaused"]) assert.ok(copy[key], `${language}.${key}`);
+    // Button names match the English-only iPhone app.
+    assert.match(copy.ready[1], /Screen Mirror/); assert.match(copy.ready[1], /Cast to TV/);
+    assert.match(copy.waitingForStart[1], /Start Casting/);
+    assert.match(copy.steps[2], /Cast to TV/);
+    assert.match(copy.lost[1], /Wi‑Fi|WLAN|wifi/);
+  }
+});
+
+test("TV languages: English acceptance titles are unchanged", () => {
+  const gate = receiver();
+  assert.equal(gate.SCREEN_COPY.ready[0], "Ready to Cast");
+  assert.equal(gate.SCREEN_COPY.stopped[0], "Casting Stopped");
+  assert.equal(gate.SCREEN_COPY.lost[0], "Connection Lost");
+  assert.equal(gate.SCREEN_TRANSLATIONS.en, undefined, "English is never overridden");
+});
+
+test("TV languages: language choice and fallback", () => {
+  const { resolveScreenLanguage } = receiver();
+  assert.equal(resolveScreenLanguage([]), "en");
+  assert.equal(resolveScreenLanguage(undefined), "en");
+  assert.equal(resolveScreenLanguage(["es-ES"]), "es");
+  assert.equal(resolveScreenLanguage(["pt_BR"]), "pt");
+  assert.equal(resolveScreenLanguage(["HI-in"]), "hi");
+  assert.equal(resolveScreenLanguage(["ja-JP", "fr-FR"]), "fr", "first supported wins");
+  assert.equal(resolveScreenLanguage(["en-GB", "de-DE"]), "en", "English before others stays English");
+  assert.equal(resolveScreenLanguage(["ja-JP", 7, null]), "en");
+});
+
+function bootScreens(languages, search = "") {
+  const nodes = {};
+  const context = { TextEncoder, URL, URLSearchParams, setTimeout: () => 1, clearTimeout() {}, location: { search },
+    navigator: { languages, language: languages[0] },
+    document: { readyState: "complete", documentElement: {}, getElementById: (id) => (nodes[id] ||= { classList: { add() {}, remove() {} } }),
+      body: { classList: { add() {}, remove() {} } } } };
+  context.globalThis = context;
+  vm.runInNewContext(fs.readFileSync(receiverSourcePath, "utf8"), context);
+  return { nodes, context };
+}
+
+test("TV languages: a Spanish TV shows Spanish screens, steps and chip", () => {
+  const { nodes, context } = bootScreens(["es-ES"]);
+  // No Google Cast in the test page, so the receiver shows its lost screen.
+  assert.equal(nodes["status-title"].textContent, "Conexión perdida");
+  assert.equal(nodes["status-step-1"].textContent, "Conecta tu iPhone a la misma red Wi‑Fi que esta TV");
+  assert.equal(nodes["phone-chip-text"].textContent, "iPhone conectado");
+  assert.equal(context.document.documentElement.lang, "es");
+});
+
+test("TV languages: an English or unsupported TV is unchanged", () => {
+  for (const languages of [["en-US"], ["ja-JP"], []]) {
+    const { nodes } = bootScreens(languages);
+    assert.equal(nodes["status-title"].textContent, "Connection Lost");
+    assert.equal((nodes["status-step-1"] || {}).textContent, undefined, "page text left as written");
+  }
+});
+
+test("TV languages: ?lang= previews a language in any browser", () => {
+  const { nodes } = bootScreens(["en-US"], "?lang=de&preview=ready");
+  assert.equal(nodes["status-title"].textContent, "Bereit zum Streamen");
+});

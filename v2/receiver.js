@@ -89,6 +89,66 @@
     // a network that keeps devices apart (guest/office Wi‑Fi, VPN, different band).
     unreachable: Object.freeze(["Can’t Reach Your iPhone", "Your iPhone and TV need to be on the same Wi‑Fi. Guest and office networks often block this."])
   });
+  // TV screens in the TV's language (P6). English stays word-for-word the
+  // acceptance copy above. App button names stay in English (in quotes) so they
+  // match what the person sees in the iPhone app, which is English-only.
+  const SCREEN_EXTRA_COPY_EN = Object.freeze({"steps": ["Connect your iPhone to the same Wi‑Fi as this TV", "Open Screen Mirror on your iPhone", "Tap Cast to TV"], "chip": "iPhone connected", "badgeStall": "Reconnecting…", "badgePaused": "Paused on your iPhone"});
+  const SCREEN_TRANSLATIONS = Object.freeze({
+    es: {"ready": ["Listo para transmitir", "En tu iPhone, abre Screen Mirror y toca «Cast to TV»."], "connected": ["Conectado", "Iniciando la transmisión…"], "stopped": ["Transmisión detenida", "Toca «Cast to TV» en tu iPhone para empezar de nuevo."], "lost": ["Conexión perdida", "Comprueba que tu iPhone y la TV estén en la misma red Wi‑Fi y vuelve a tocar «Cast to TV»."], "reconnecting": ["Reconectando…", "Mantén Screen Mirror abierta en tu iPhone."], "waitingForStart": ["Listo para transmitir", "Tu iPhone está conectado. Toca «Start Casting» en la app."], "stalledLost": ["Esperando a tu iPhone", "Desbloquea tu iPhone para continuar. Si no vuelve, toca «Cast to TV» de nuevo."], "unreachable": ["No se puede conectar con tu iPhone", "Tu iPhone y la TV deben estar en la misma red Wi‑Fi. Las redes de invitados y de oficina suelen bloquearlo."], "steps": ["Conecta tu iPhone a la misma red Wi‑Fi que esta TV", "Abre Screen Mirror en tu iPhone", "Toca «Cast to TV»"], "chip": "iPhone conectado", "badgeStall": "Reconectando…", "badgePaused": "En pausa en tu iPhone"},
+    pt: {"ready": ["Pronto para transmitir", "No seu iPhone, abra o Screen Mirror e toque em “Cast to TV”."], "connected": ["Conectado", "Iniciando a transmissão…"], "stopped": ["Transmissão encerrada", "Toque em “Cast to TV” no seu iPhone para começar de novo."], "lost": ["Conexão perdida", "Verifique se o iPhone e a TV estão na mesma rede Wi‑Fi e toque em “Cast to TV” novamente."], "reconnecting": ["Reconectando…", "Mantenha o Screen Mirror aberto no seu iPhone."], "waitingForStart": ["Pronto para transmitir", "Seu iPhone está conectado. Toque em “Start Casting” no app."], "stalledLost": ["Aguardando seu iPhone", "Desbloqueie o iPhone para continuar. Se não voltar, toque em “Cast to TV” novamente."], "unreachable": ["Não foi possível acessar seu iPhone", "O iPhone e a TV precisam estar na mesma rede Wi‑Fi. Redes de convidados e de escritório costumam bloquear isso."], "steps": ["Conecte o iPhone à mesma rede Wi‑Fi desta TV", "Abra o Screen Mirror no iPhone", "Toque em “Cast to TV”"], "chip": "iPhone conectado", "badgeStall": "Reconectando…", "badgePaused": "Pausado no seu iPhone"},
+    fr: {"ready": ["Prêt à diffuser", "Sur votre iPhone, ouvrez Screen Mirror et touchez « Cast to TV »."], "connected": ["Connecté", "Lancement de la diffusion…"], "stopped": ["Diffusion arrêtée", "Touchez « Cast to TV » sur votre iPhone pour recommencer."], "lost": ["Connexion perdue", "Vérifiez que votre iPhone et le téléviseur sont sur le même Wi‑Fi, puis touchez à nouveau « Cast to TV »."], "reconnecting": ["Reconnexion…", "Gardez Screen Mirror ouvert sur votre iPhone."], "waitingForStart": ["Prêt à diffuser", "Votre iPhone est connecté. Touchez « Start Casting » dans l’app."], "stalledLost": ["En attente de votre iPhone", "Déverrouillez votre iPhone pour continuer. Si rien ne revient, touchez à nouveau « Cast to TV »."], "unreachable": ["Impossible de joindre votre iPhone", "Votre iPhone et le téléviseur doivent être sur le même Wi‑Fi. Les réseaux invités et professionnels bloquent souvent cela."], "steps": ["Connectez votre iPhone au même Wi‑Fi que ce téléviseur", "Ouvrez Screen Mirror sur votre iPhone", "Touchez « Cast to TV »"], "chip": "iPhone connecté", "badgeStall": "Reconnexion…", "badgePaused": "En pause sur votre iPhone"},
+    de: {"ready": ["Bereit zum Streamen", "Öffne auf deinem iPhone Screen Mirror und tippe auf „Cast to TV“."], "connected": ["Verbunden", "Übertragung wird gestartet…"], "stopped": ["Übertragung beendet", "Tippe auf deinem iPhone auf „Cast to TV“, um neu zu starten."], "lost": ["Verbindung verloren", "Prüfe, ob iPhone und Fernseher im selben WLAN sind, und tippe dann erneut auf „Cast to TV“."], "reconnecting": ["Verbinde neu…", "Lass Screen Mirror auf deinem iPhone geöffnet."], "waitingForStart": ["Bereit zum Streamen", "Dein iPhone ist verbunden. Tippe in der App auf „Start Casting“."], "stalledLost": ["Warte auf dein iPhone", "Entsperre dein iPhone, um fortzufahren. Falls nichts passiert, tippe erneut auf „Cast to TV“."], "unreachable": ["iPhone nicht erreichbar", "iPhone und Fernseher müssen im selben WLAN sein. Gäste- und Firmennetzwerke blockieren das oft."], "steps": ["Verbinde dein iPhone mit demselben WLAN wie diesen Fernseher", "Öffne Screen Mirror auf deinem iPhone", "Tippe auf „Cast to TV“"], "chip": "iPhone verbunden", "badgeStall": "Verbinde neu…", "badgePaused": "Auf deinem iPhone pausiert"},
+    it: {"ready": ["Pronto per trasmettere", "Sul tuo iPhone, apri Screen Mirror e tocca “Cast to TV”."], "connected": ["Connesso", "Avvio della trasmissione…"], "stopped": ["Trasmissione interrotta", "Tocca “Cast to TV” sul tuo iPhone per ricominciare."], "lost": ["Connessione persa", "Verifica che iPhone e TV siano sulla stessa rete Wi‑Fi, poi tocca di nuovo “Cast to TV”."], "reconnecting": ["Riconnessione…", "Tieni Screen Mirror aperta sul tuo iPhone."], "waitingForStart": ["Pronto per trasmettere", "Il tuo iPhone è connesso. Tocca “Start Casting” nell’app."], "stalledLost": ["In attesa del tuo iPhone", "Sblocca l’iPhone per continuare. Se non riprende, tocca di nuovo “Cast to TV”."], "unreachable": ["Impossibile raggiungere l’iPhone", "iPhone e TV devono essere sulla stessa rete Wi‑Fi. Le reti ospiti e aziendali spesso lo bloccano."], "steps": ["Collega l’iPhone alla stessa rete Wi‑Fi di questa TV", "Apri Screen Mirror sull’iPhone", "Tocca “Cast to TV”"], "chip": "iPhone connesso", "badgeStall": "Riconnessione…", "badgePaused": "In pausa sull’iPhone"},
+    nl: {"ready": ["Klaar om te casten", "Open Screen Mirror op je iPhone en tik op ‘Cast to TV’."], "connected": ["Verbonden", "Je cast wordt gestart…"], "stopped": ["Casten gestopt", "Tik op je iPhone op ‘Cast to TV’ om opnieuw te beginnen."], "lost": ["Verbinding verbroken", "Controleer of je iPhone en tv op hetzelfde wifi-netwerk zitten en tik opnieuw op ‘Cast to TV’."], "reconnecting": ["Opnieuw verbinden…", "Houd Screen Mirror open op je iPhone."], "waitingForStart": ["Klaar om te casten", "Je iPhone is verbonden. Tik in de app op ‘Start Casting’."], "stalledLost": ["Wachten op je iPhone", "Ontgrendel je iPhone om verder te gaan. Komt het beeld niet terug, tik dan opnieuw op ‘Cast to TV’."], "unreachable": ["Kan je iPhone niet bereiken", "Je iPhone en tv moeten op hetzelfde wifi-netwerk zitten. Gast- en kantoornetwerken blokkeren dit vaak."], "steps": ["Verbind je iPhone met hetzelfde wifi-netwerk als deze tv", "Open Screen Mirror op je iPhone", "Tik op ‘Cast to TV’"], "chip": "iPhone verbonden", "badgeStall": "Opnieuw verbinden…", "badgePaused": "Gepauzeerd op je iPhone"},
+    id: {"ready": ["Siap untuk Cast", "Di iPhone Anda, buka Screen Mirror lalu ketuk “Cast to TV”."], "connected": ["Terhubung", "Memulai cast…"], "stopped": ["Cast Dihentikan", "Ketuk “Cast to TV” di iPhone Anda untuk memulai lagi."], "lost": ["Koneksi Terputus", "Pastikan iPhone dan TV terhubung ke Wi‑Fi yang sama, lalu ketuk “Cast to TV” lagi."], "reconnecting": ["Menghubungkan ulang…", "Biarkan Screen Mirror tetap terbuka di iPhone Anda."], "waitingForStart": ["Siap untuk Cast", "iPhone Anda sudah terhubung. Ketuk “Start Casting” di aplikasi."], "stalledLost": ["Menunggu iPhone Anda", "Buka kunci iPhone untuk melanjutkan. Jika tidak kembali, ketuk “Cast to TV” lagi."], "unreachable": ["Tidak Dapat Menjangkau iPhone Anda", "iPhone dan TV harus terhubung ke Wi‑Fi yang sama. Jaringan tamu dan kantor sering memblokir ini."], "steps": ["Hubungkan iPhone ke Wi‑Fi yang sama dengan TV ini", "Buka Screen Mirror di iPhone", "Ketuk “Cast to TV”"], "chip": "iPhone terhubung", "badgeStall": "Menghubungkan ulang…", "badgePaused": "Dijeda di iPhone Anda"},
+    tr: {"ready": ["Yayına Hazır", "iPhone’unuzda Screen Mirror’ı açın ve “Cast to TV”ye dokunun."], "connected": ["Bağlandı", "Yayın başlatılıyor…"], "stopped": ["Yayın Durduruldu", "Yeniden başlatmak için iPhone’unuzda “Cast to TV”ye dokunun."], "lost": ["Bağlantı Kesildi", "iPhone’unuzun ve TV’nin aynı Wi‑Fi ağında olduğundan emin olun, ardından tekrar “Cast to TV”ye dokunun."], "reconnecting": ["Yeniden bağlanılıyor…", "Screen Mirror’ı iPhone’unuzda açık tutun."], "waitingForStart": ["Yayına Hazır", "iPhone’unuz bağlı. Uygulamada “Start Casting”e dokunun."], "stalledLost": ["iPhone’unuz Bekleniyor", "Devam etmek için iPhone’unuzun kilidini açın. Geri gelmezse tekrar “Cast to TV”ye dokunun."], "unreachable": ["iPhone’unuza Ulaşılamıyor", "iPhone’unuz ve TV aynı Wi‑Fi ağında olmalıdır. Misafir ve ofis ağları bunu sıklıkla engeller."], "steps": ["iPhone’unuzu bu TV ile aynı Wi‑Fi ağına bağlayın", "iPhone’unuzda Screen Mirror’ı açın", "“Cast to TV”ye dokunun"], "chip": "iPhone bağlı", "badgeStall": "Yeniden bağlanılıyor…", "badgePaused": "iPhone’unuzda duraklatıldı"},
+    pl: {"ready": ["Gotowe do przesyłania", "Na iPhonie otwórz Screen Mirror i stuknij „Cast to TV”."], "connected": ["Połączono", "Rozpoczynanie przesyłania…"], "stopped": ["Przesyłanie zatrzymane", "Stuknij „Cast to TV” na iPhonie, aby zacząć ponownie."], "lost": ["Utracono połączenie", "Sprawdź, czy iPhone i telewizor są w tej samej sieci Wi‑Fi, a potem ponownie stuknij „Cast to TV”."], "reconnecting": ["Ponowne łączenie…", "Nie zamykaj Screen Mirror na iPhonie."], "waitingForStart": ["Gotowe do przesyłania", "iPhone jest połączony. Stuknij „Start Casting” w aplikacji."], "stalledLost": ["Czekam na iPhone’a", "Odblokuj iPhone’a, aby kontynuować. Jeśli obraz nie wróci, ponownie stuknij „Cast to TV”."], "unreachable": ["Nie można połączyć się z iPhone’em", "iPhone i telewizor muszą być w tej samej sieci Wi‑Fi. Sieci gości i firmowe często to blokują."], "steps": ["Połącz iPhone’a z tą samą siecią Wi‑Fi co telewizor", "Otwórz Screen Mirror na iPhonie", "Stuknij „Cast to TV”"], "chip": "iPhone połączony", "badgeStall": "Ponowne łączenie…", "badgePaused": "Wstrzymano na iPhonie"},
+    hi: {"ready": ["कास्ट करने के लिए तैयार", "अपने iPhone पर Screen Mirror खोलें और “Cast to TV” पर टैप करें।"], "connected": ["कनेक्ट हो गया", "आपकी कास्टिंग शुरू हो रही है…"], "stopped": ["कास्टिंग बंद हो गई", "फिर से शुरू करने के लिए अपने iPhone पर “Cast to TV” पर टैप करें।"], "lost": ["कनेक्शन टूट गया", "देखें कि आपका iPhone और TV एक ही Wi‑Fi पर हैं, फिर दोबारा “Cast to TV” पर टैप करें।"], "reconnecting": ["फिर से कनेक्ट हो रहा है…", "अपने iPhone पर Screen Mirror खुला रखें।"], "waitingForStart": ["कास्ट करने के लिए तैयार", "आपका iPhone कनेक्ट है। ऐप में “Start Casting” पर टैप करें।"], "stalledLost": ["आपके iPhone का इंतज़ार है", "जारी रखने के लिए अपना iPhone अनलॉक करें। अगर तस्वीर वापस न आए, तो दोबारा “Cast to TV” पर टैप करें।"], "unreachable": ["आपके iPhone तक नहीं पहुँच पा रहे", "आपका iPhone और TV एक ही Wi‑Fi पर होने चाहिए। गेस्ट और ऑफ़िस नेटवर्क अक्सर इसे ब्लॉक करते हैं।"], "steps": ["अपने iPhone को इस TV वाले Wi‑Fi से कनेक्ट करें", "अपने iPhone पर Screen Mirror खोलें", "“Cast to TV” पर टैप करें"], "chip": "iPhone कनेक्ट है", "badgeStall": "फिर से कनेक्ट हो रहा है…", "badgePaused": "आपके iPhone पर रुका है"},
+  });
+  // Picks the TV's language: ?lang= (design preview) first, then the device
+  // languages in order; anything unsupported falls back to English.
+  function resolveScreenLanguage(preferred) {
+    for (const value of preferred || []) {
+      if (typeof value !== "string") continue;
+      const base = value.trim().toLowerCase().split(/[-_]/)[0];
+      if (base === "en") return "en";
+      if (Object.prototype.hasOwnProperty.call(SCREEN_TRANSLATIONS, base)) return base;
+    }
+    return "en";
+  }
+  function deviceLanguages() {
+    const list = [];
+    try {
+      const forced = new URLSearchParams(global.location && global.location.search).get("lang");
+      if (forced) list.push(forced);
+    } catch (_) {}
+    try {
+      const nav = global.navigator;
+      if (nav && Array.isArray(nav.languages)) list.push(...nav.languages);
+      if (nav && typeof nav.language === "string") list.push(nav.language);
+    } catch (_) {}
+    return list;
+  }
+  let screenLanguage = "en";
+  function screenText(key) {
+    const local = screenLanguage !== "en" ? SCREEN_TRANSLATIONS[screenLanguage] : null;
+    if (local && local[key] !== undefined) return local[key];
+    return SCREEN_COPY[key] || SCREEN_EXTRA_COPY_EN[key];
+  }
+  // Static texts (chip, steps, badge) are in the page; replace them once.
+  function applyScreenLanguage() {
+    if (screenLanguage === "en") return;
+    try {
+      document.documentElement.lang = screenLanguage;
+      const chip = document.getElementById("phone-chip-text");
+      if (chip) chip.textContent = screenText("chip");
+      const steps = screenText("steps");
+      for (let index = 0; index < steps.length; index += 1) {
+        const step = document.getElementById(`status-step-${index + 1}`);
+        if (step) step.textContent = steps[index];
+      }
+    } catch (_) {}
+  }
   // Small "iPhone connected" chip and the how-to steps, per screen.
   const SCREEN_SHOWS_PHONE_CHIP = Object.freeze(["connected", "waitingForStart", "reconnecting"]);
   const SCREEN_SHOWS_STEPS = Object.freeze(["ready", "unreachable"]);
@@ -121,7 +181,7 @@
       if (!badge) return;
       badge.hidden = !kind;
       badge.classList.toggle("paused", kind === "paused");
-      if (text && kind) text.textContent = kind === "paused" ? "Paused on your iPhone" : "Reconnecting…";
+      if (text && kind) text.textContent = screenText(kind === "paused" ? "badgePaused" : "badgeStall");
     } catch (_) {}
   }
   function setStallBadge(visible) {
@@ -177,7 +237,7 @@
     if (IDLE_RETURN_TO_HOME_STATES.includes(state)) scheduleIdleReturnToHomeTimer();
     else cancelIdleReturnToHomeTimer();
     if (!ui) return;
-    const copy = SCREEN_COPY[state];
+    const copy = SCREEN_COPY[state] ? screenText(state) : null;
     ui.panel.hidden = state === "playing";
     document.body.classList.remove("receiver-waiting");
     if (state === "ready" || state === "reconnecting") document.body.classList.add("receiver-waiting");
@@ -1784,6 +1844,8 @@
   function boot() {
     ui = { panel: document.getElementById("idle-screen"), title: document.getElementById("status-title"), detail: document.getElementById("status-detail"),
       chip: document.getElementById("phone-chip"), steps: document.getElementById("status-steps"), content: document.getElementById("status-content") };
+    screenLanguage = resolveScreenLanguage(deviceLanguages());
+    applyScreenLanguage();
     // Design preview: receiver.html?preview=<screen> renders one screen without
     // Google Cast (for reviewing TV screens in a browser). No effect on TVs.
     try {
@@ -1850,6 +1912,6 @@
     lifecycleDiagnostics.record("receiver_caf_start_returned");
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MEDIA_FEATURES, effectiveReceiverConfigHash, SCREEN_COPY, SCREEN_SHOWS_PHONE_CHIP, SCREEN_SHOWS_STEPS, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ SCREEN_TRANSLATIONS, SCREEN_EXTRA_COPY_EN, resolveScreenLanguage, screenLanguage: () => screenLanguage, MEDIA_FEATURES, effectiveReceiverConfigHash, SCREEN_COPY, SCREEN_SHOWS_PHONE_CHIP, SCREEN_SHOWS_STEPS, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
