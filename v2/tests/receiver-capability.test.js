@@ -859,7 +859,7 @@ test("media-connection visibility is opt-in by the iPhone", () => {
 // TV session with a fake Cast player, for photos/videos inside our TV app (P3).
 async function playerSession() {
   const messages = []; const sources = []; const sockets = []; const nodes = {}; const classes = new Set(); const timers = [];
-  let receiverListener; let loadInterceptor; const playerEvents = {}; const systemEvents = {}; let stops = 0;
+  let receiverListener; let loadInterceptor; const playerEvents = {}; const systemEvents = {}; let stops = 0; let playerStateValue = "IDLE"; let contextStops = 0;
   const video = { buffered: { length: 0 }, currentTime: 0, playbackRate: 1, pause() {}, load() {}, removeAttribute() {},
     addEventListener() {}, requestVideoFrameCallback() { return 1; }, cancelVideoFrameCallback() {} };
   class MediaSource {
@@ -872,6 +872,7 @@ async function playerSession() {
   const playerManager = {
     setMessageInterceptor(type, callback) { if (type === "LOAD") loadInterceptor = callback; },
     addEventListener(type, callback) { playerEvents[type] = callback; },
+    getPlayerState: () => playerStateValue,
     stop() { stops += 1; }
   };
   const context = { ArrayBuffer, Uint8Array, DataView, TextEncoder, performance: { now: () => 0 },
@@ -880,10 +881,10 @@ async function playerSession() {
     document: { readyState: "complete", getElementById: (id) => id === "probe-video" ? video : (nodes[id] ||= {}), addEventListener() {},
       body: { classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name), toggle: (name, on) => on ? classes.add(name) : classes.delete(name) } } },
     cast: { framework: {
-      CastReceiverContext: { getInstance: () => ({ addEventListener: (name, callback) => { systemEvents[name] = callback; }, addCustomMessageListener: (_, callback) => { receiverListener = callback; }, start() {}, getPlayerManager: () => playerManager, getSenders: () => [], sendCustomMessage: (_, sender, message) => messages.push({ sender, ...message }) }) },
+      CastReceiverContext: { getInstance: () => ({ addEventListener: (name, callback) => { const previous = systemEvents[name]; systemEvents[name] = previous ? (e) => { previous(e); callback(e); } : callback; }, addCustomMessageListener: (_, callback) => { receiverListener = callback; }, start() {}, stop() { contextStops += 1; }, getPlayerManager: () => playerManager, getSenders: () => [], sendCustomMessage: (_, sender, message) => messages.push({ sender, ...message }) }) },
       CastReceiverOptions: function () {},
       messages: { MessageType: { LOAD: "LOAD" } },
-      events: { EventType: { ERROR: "ERROR", REQUEST_STOP: "REQUEST_STOP" } },
+      events: { EventType: { ERROR: "ERROR", REQUEST_STOP: "REQUEST_STOP" }, DetailedErrorCode: { LOAD_INTERRUPTED: 904, LOAD_FAILED: 905 } },
       system: { EventType: { READY: "ready", SENDER_CONNECTED: "sender_connected", SENDER_DISCONNECTED: "sender_disconnected" }, MessageType: { JSON: "JSON" } } } } };
   context.URL = class extends URL { static createObjectURL() { return "blob:test"; } };
   vm.runInNewContext(fs.readFileSync(receiverSourcePath, "utf8"), context);
@@ -896,7 +897,7 @@ async function playerSession() {
   };
   return { gate: context.ScreenMirrorReceiverCapabilityGate, nodes, classes, sockets, messages, timers, playerEvents, startMirroring,
     load: (contentType) => loadInterceptor({ media: { contentId: "http://192.168.1.2/a", contentType } }),
-    stops: () => stops };
+    stops: () => stops, setPlayerState: (value) => { playerStateValue = value; }, contextStops: () => contextStops, systemEvents };
 }
 
 test("photos and videos: a LOAD shows our player over the idle screen", async () => {
@@ -956,4 +957,30 @@ test("photos and videos: no player in the page never breaks mirroring", () => {
   const source = fs.readFileSync(receiverSourcePath, "utf8");
   assert.match(source, /typeof context\.getPlayerManager !== "function"/);
   assert.match(source, /if \(media\) \{\n\s*stopPlayerForMirroring\(\);/);
+});
+
+test("photos and videos: a slideshow item replaced while loading is not an error", async () => {
+  const s = await playerSession();
+  s.load("image/jpeg");
+  s.playerEvents.ERROR({ detailedErrorCode: 904 });
+  assert.equal(s.gate.playerActive(), true);
+  s.setPlayerState("PLAYING");
+  s.playerEvents.ERROR({ detailedErrorCode: 999 });
+  assert.equal(s.gate.playerActive(), true, "non-fatal error while playing keeps the player");
+  s.setPlayerState("IDLE");
+  s.playerEvents.ERROR({ detailedErrorCode: 905 });
+  assert.equal(s.nodes["status-title"].textContent, "Can’t Play This");
+});
+
+test("photos and videos: with no phone, a photo returns the TV home; a playing video may finish", async () => {
+  const s = await playerSession();
+  s.load("video/mp4");
+  s.setPlayerState("PLAYING");
+  s.systemEvents.sender_disconnected({ senderId: "sender" });
+  const runNoSender = () => { const index = s.timers.findIndex((t) => t && t.ms === s.gate.NO_SENDER_RETURN_TO_HOME_MS); assert.ok(index >= 0); const { callback } = s.timers[index]; s.timers[index] = null; callback(); };
+  runNoSender();
+  assert.equal(s.contextStops(), 0, "video still playing");
+  s.setPlayerState("IDLE");
+  runNoSender();
+  assert.equal(s.contextStops(), 1, "finished: back to the TV home screen");
 });

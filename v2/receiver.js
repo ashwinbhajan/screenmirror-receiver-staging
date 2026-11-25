@@ -151,7 +151,10 @@
       noSenderTimer = null;
       let senders = 1;
       try { senders = context && typeof context.getSenders === "function" ? context.getSenders().length : 1; } catch (_) {}
-      if (senders === 0 && currentScreen !== "playing" && !playerActive) {
+      if (senders === 0 && currentScreen !== "playing") {
+        // A video still playing with no phone may finish first; a photo or an
+        // ended video with no phone returns the TV to its home screen.
+        if (playerActive && ["PLAYING", "BUFFERING"].includes(playerState())) { scheduleNoSenderReturnToHome(); return; }
         try { if (context && typeof context.stop === "function") context.stop(); } catch (_) {}
       }
     }, NO_SENDER_RETURN_TO_HOME_MS);
@@ -192,6 +195,10 @@
       showScreen(screenAfter || "ready");
     }
   }
+  function playerState() {
+    try { return playerManager && typeof playerManager.getPlayerState === "function" ? playerManager.getPlayerState() : null; }
+    catch (_) { return null; }
+  }
   function stopPlayerForMirroring() {
     if (!playerActive) return;
     try { if (playerManager && typeof playerManager.stop === "function") playerManager.stop(); } catch (_) {}
@@ -210,8 +217,17 @@
         return request;
       });
       const events = framework.events.EventType;
-      playerManager.addEventListener(events.ERROR, () => {
-        if (playerActive) setPlayerActive(false, "mediaError");
+      playerManager.addEventListener(events.ERROR, (errorEvent) => {
+        if (!playerActive) return;
+        // A slideshow sends the next item while the previous one may still be
+        // loading: that interruption is not a failure.
+        const codes = framework.events.DetailedErrorCode || {};
+        const code = errorEvent && errorEvent.detailedErrorCode;
+        if (code !== undefined && codes.LOAD_INTERRUPTED !== undefined && code === codes.LOAD_INTERRUPTED) return;
+        // Non-fatal errors leave the player running; only a stopped player is a failure.
+        const state = playerState();
+        if (state && state !== "IDLE") return;
+        setPlayerActive(false, "mediaError");
       });
       // Stop from the iPhone (or the TV remote): back to the ready screen.
       playerManager.addEventListener(events.REQUEST_STOP, () => {
@@ -1882,7 +1898,7 @@
       if (types.SENDER_DISCONNECTED) context.addEventListener(types.SENDER_DISCONNECTED, () => {
         let senders = 1;
         try { senders = typeof context.getSenders === "function" ? context.getSenders().length : 1; } catch (_) {}
-        if (senders === 0 && currentScreen !== "playing" && !playerActive) scheduleNoSenderReturnToHome();
+        if (senders === 0 && currentScreen !== "playing") scheduleNoSenderReturnToHome();
       });
     }
     try {
