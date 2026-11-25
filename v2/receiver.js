@@ -231,7 +231,7 @@
   // Features this TV app offers the iPhone on the media connection. Older
   // iPhone apps ignore the extra key; newer ones only send the matching
   // messages after seeing it, so neither side ever gets an unknown message.
-  const MEDIA_FEATURES = Object.freeze(["senderPause", "mediaVisibility", "mediaReconnect"]);
+  const MEDIA_FEATURES = Object.freeze(["senderPause", "mediaVisibility", "mediaReconnect", "senderAlive"]);
   // Wi-Fi grace: after a short network drop the TV keeps the last picture and
   // reconnects to the same iPhone address for up to this long. Only used when
   // the iPhone opted in (senderFeatures "reconnect"); older iPhones end the
@@ -1638,6 +1638,10 @@
                 }
                 return;
               }
+              // Diagnostics 31: the iPhone answers the TV's liveness check while the
+              // picture is still, so a still screen with sound off is not "silent".
+              // Receiving it already refreshed lastSenderMessageAt; nothing else to do.
+              if (control.type === "senderAlive" && control.protocolVersion === PROTOCOL_VERSION && Object.keys(control).length === 2) return;
               if (control.type === "normalStop" && control.protocolVersion === PROTOCOL_VERSION && Object.keys(control).length === 2) {
                 sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
                 clearVideoForReceiverStop("stopped");

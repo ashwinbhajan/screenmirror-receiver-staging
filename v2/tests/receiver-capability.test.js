@@ -841,7 +841,7 @@ test("TV screens keep the acceptance titles and add the unreachable screen", () 
 
 test("pause signal is negotiated and strictly shaped", () => {
   const gate = receiver();
-  assert.deepEqual(Array.from(gate.MEDIA_FEATURES), ["senderPause", "mediaVisibility", "mediaReconnect"]);
+  assert.deepEqual(Array.from(gate.MEDIA_FEATURES), ["senderPause", "mediaVisibility", "mediaReconnect", "senderAlive"]);
   const source = fs.readFileSync(receiverSourcePath, "utf8");
   assert.match(source, /control\.type === "senderPaused" \|\| control\.type === "senderResumed"\)\s*\n\s*&& control\.protocolVersion === PROTOCOL_VERSION && Object\.keys\(control\)\.length === 2/);
   assert.match(source, /type: "latencyCapability", mode: "requestVideoFrameCallback", features: MEDIA_FEATURES/);
@@ -1356,4 +1356,15 @@ test("every phone message counts as proof the phone is still there", () => {
   assert.match(source, /candidate\.onmessage = \(message\) => \{\n\s*if \(socket !== candidate\) return;\n\s*lastSenderMessageAt = performance\.now\(\);/);
   // While the phone keeps talking the TV re-checks instead of giving up for good.
   assert.match(source, /if \(!senderReconnect\) return;[\s\S]{0,400}const watchPhoneSilence = \(\) => \{[\s\S]{0,400}if \(!endStallIfPhoneSilent\(\)\) watchPhoneSilence\(\);[\s\S]{0,120}\}, MEDIA_LIVENESS_PROBE_MS\);/);
+});
+
+test("the iPhone's still-here answer is accepted quietly and counts as phone activity (diagnostics 31)", () => {
+  const source = fs.readFileSync(receiverSourcePath, "utf8");
+  // Accepted with the exact fixed shape, before the unknown-message protocol error.
+  const accept = source.indexOf('if (control.type === "senderAlive" && control.protocolVersion === PROTOCOL_VERSION && Object.keys(control).length === 2) return;');
+  const protocolError = source.indexOf('sendReceiverDiagnostic(event, request, "receiver_error_before_disconnect_protocol_error");');
+  assert.ok(accept > 0 && protocolError > accept);
+  // The message refreshes the silence clock because every message does, first.
+  const refresh = source.indexOf("lastSenderMessageAt = performance.now();\n            if (typeof message.data === \"string\")");
+  assert.ok(refresh > 0 && refresh < accept);
 });
