@@ -131,7 +131,13 @@
   // Features this TV app offers the iPhone on the media connection. Older
   // iPhone apps ignore the extra key; newer ones only send the matching
   // messages after seeing it, so neither side ever gets an unknown message.
-  const MEDIA_FEATURES = Object.freeze(["senderPause"]);
+  const MEDIA_FEATURES = Object.freeze(["senderPause", "mediaVisibility"]);
+  // Media connections whose iPhone opted in to visibility reports (it sends
+  // senderFeatures only after seeing "mediaVisibility" above).
+  const mediaVisibilityListeners = new Set();
+  function notifyMediaVisibility(visibility) {
+    for (const send of mediaVisibilityListeners) { try { send(visibility); } catch (_) {} }
+  }
   // No phone connected while idle: return the TV to its home screen instead of
   // keeping the receiver alive (and possibly hidden behind another TV app).
   function cancelNoSenderTimer() {
@@ -640,7 +646,7 @@
     let lastAppendAtMs = null; let lastRenderAtMs = null; let renderedMediaTime = NaN;
     let decodeDuration = NaN; let displayLead = NaN; let receiverDrops = 0;
     let seekCount = 0; let lastSeekKind = 0; let rateChanges = 0;
-    let senderPaused = false; let pendingLiveJump = false;
+    let senderPaused = false; let pendingLiveJump = false; let mediaVisibilityHandler = null;
     let source; let buffer; let audioBuffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingFragment = null; let lastAppendingSyncTimes = []; const syncPoints = []; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let healthySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let lastAudioType = 0; let audioTrimPending = false; let audioCreditSequence = 0; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
     if (activeReceiverPagehideListener && typeof global.removeEventListener === "function") {
       global.removeEventListener("pagehide", activeReceiverPagehideListener);
@@ -766,6 +772,7 @@
     const clearVideoForReceiverStop = (screen) => {
       if (receiverStopped) return;
       receiverStopped = true;
+      if (mediaVisibilityHandler) { mediaVisibilityListeners.delete(mediaVisibilityHandler); mediaVisibilityHandler = null; }
       healthyCatchup.close();
       healthySeekPending = false;
       recoverySeekPending = false;
@@ -1232,6 +1239,15 @@
                 sendReceiverDiagnostic(event, request, "receiver_endpoint_fetch_succeeded");
                 return;
               }
+              if (control.type === "senderFeatures" && control.protocolVersion === PROTOCOL_VERSION
+                  && Object.keys(control).length === 3 && Array.isArray(control.features)) {
+                if (control.features.includes("visibility") && !mediaVisibilityHandler) {
+                  mediaVisibilityHandler = (visibility) => sendLatency({ type: "receiverVisibility", protocolVersion: PROTOCOL_VERSION, visibility });
+                  mediaVisibilityListeners.add(mediaVisibilityHandler);
+                  mediaVisibilityHandler(currentVisibility());
+                }
+                return;
+              }
               if ((control.type === "senderPaused" || control.type === "senderResumed")
                   && control.protocolVersion === PROTOCOL_VERSION && Object.keys(control).length === 2) {
                 if (control.type === "senderPaused") {
@@ -1452,6 +1468,7 @@
   }
   function notifyVisibilityChanged() {
     const visibility = currentVisibility();
+    notifyMediaVisibility(visibility);
     if (visibility === lastReportedVisibility) return;
     lastReportedVisibility = visibility;
     for (const senderId of visibilitySubscribers) {

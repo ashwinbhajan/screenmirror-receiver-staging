@@ -841,11 +841,17 @@ test("TV screens keep the acceptance titles and add the unreachable screen", () 
 
 test("pause signal is negotiated and strictly shaped", () => {
   const gate = receiver();
-  assert.deepEqual(Array.from(gate.MEDIA_FEATURES), ["senderPause"]);
+  assert.deepEqual(Array.from(gate.MEDIA_FEATURES), ["senderPause", "mediaVisibility"]);
   const source = fs.readFileSync(receiverSourcePath, "utf8");
   assert.match(source, /control\.type === "senderPaused" \|\| control\.type === "senderResumed"\)\s*\n\s*&& control\.protocolVersion === PROTOCOL_VERSION && Object\.keys\(control\)\.length === 2/);
   assert.match(source, /type: "latencyCapability", mode: "requestVideoFrameCallback", features: MEDIA_FEATURES/);
   assert.match(source, /type: "latencyCapability", mode: "playbackAckFallback", features: MEDIA_FEATURES/);
   // Unknown controls still end the session exactly as before.
   assert.match(source, /stop\("protocol_error"\); return;\n\s*\}/);
+});
+
+test("media-connection visibility is opt-in by the iPhone", () => {
+  const source = fs.readFileSync(receiverSourcePath, "utf8");
+  assert.match(source, /control\.type === "senderFeatures" && control\.protocolVersion === PROTOCOL_VERSION\s*\n\s*&& Object\.keys\(control\)\.length === 3/);
+  assert.match(source, /type: "receiverVisibility", protocolVersion: PROTOCOL_VERSION, visibility/);
 });
