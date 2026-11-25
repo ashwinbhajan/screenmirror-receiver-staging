@@ -1266,3 +1266,11 @@ test("after the phone comes back from another app, replies reach its new address
   assert.match(source, /context\.sendCustomMessage\(NAMESPACE, currentReplySender\(senderId\), payload\)/);
   assert.match(source, /context\.sendCustomMessage\(NAMESPACE, currentReplySender\(event\.senderId\), \{ type: "firstRenderedFrame"/);
 });
+
+test("a silent connection after the phone's Wi-Fi drops ends on Connection Lost, not Unlock your iPhone", () => {
+  const source = fs.readFileSync(receiverSourcePath, "utf8");
+  // The 30 s stall step ends as "lost" when the phone negotiated reconnecting.
+  assert.match(source, /if \(senderReconnect\) \{\n\s*sendMediaResult\(event\.senderId, request\.requestId, "receiver_stall_ended_as_connection_lost"\);[\s\S]{0,300}clearVideoForReceiverStop\("lost"\);\n\s*return;\n\s*\}\n\s*\/\/ Stage 3: give a clear next step/);
+  // Older phones keep the previous waiting screen.
+  assert.match(source, /showScreen\("stalledLost"\);\n\s*sendMediaResult\(event\.senderId, request\.requestId, "receiver_stall_gave_up"\);/);
+});

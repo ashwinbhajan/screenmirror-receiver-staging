@@ -928,6 +928,19 @@
           reconnectingScreenTimer = global.setTimeout(() => {
             reconnectingScreenTimer = undefined;
             if (receiverStopped || lastPlayback.advancedAt !== stalledSince) return;
+            // Diagnostics 25: with the iPhone's Wi‑Fi off the connection goes
+            // silent instead of closing, so the TV said "Unlock your iPhone".
+            // A phone that supports reconnecting gives up after 15 s and a lock
+            // ends sharing cleanly, so 30 s of silence means the phone is gone.
+            if (senderReconnect) {
+              sendMediaResult(event.senderId, request.requestId, "receiver_stall_ended_as_connection_lost");
+              mediaStopRequested = true;
+              clearMediaReconnectTimers(); mediaReconnecting = false;
+              try { socket && socket.close(); } catch (_) {}
+              sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
+              clearVideoForReceiverStop("lost");
+              return;
+            }
             // Stage 3: give a clear next step; resumes by itself if media returns.
             showScreen("stalledLost");
             sendMediaResult(event.senderId, request.requestId, "receiver_stall_gave_up");
