@@ -1269,8 +1269,10 @@ test("after the phone comes back from another app, replies reach its new address
 
 test("a silent connection after the phone's Wi-Fi drops ends on Connection Lost, not Unlock your iPhone", () => {
   const source = fs.readFileSync(receiverSourcePath, "utf8");
-  // The 30 s stall step ends as "lost" when the phone negotiated reconnecting.
-  assert.match(source, /if \(senderReconnect\) \{\n\s*sendMediaResult\(event\.senderId, request\.requestId, "receiver_stall_ended_as_connection_lost"\);[\s\S]{0,300}clearVideoForReceiverStop\("lost"\);\n\s*return;\n\s*\}\n\s*\/\/ Stage 3: give a clear next step/);
+  // The 30 s stall step ends as "lost" when the phone negotiated reconnecting
+  // and has also gone quiet (diagnostics 31).
+  assert.match(source, /if \(!stallEndsAsConnectionLost\(senderReconnect, lastSenderMessageAt, performance\.now\(\)\)\) return false;\n\s*sendMediaResult\(event\.senderId, request\.requestId, "receiver_stall_ended_as_connection_lost"\);[\s\S]{0,300}clearVideoForReceiverStop\("lost"\);\n\s*return true;/);
+  assert.match(source, /if \(endStallIfPhoneSilent\(\)\) return;\n\s*\/\/ Stage 3: give a clear next step/);
   // Older phones keep the previous waiting screen.
   assert.match(source, /showScreen\("stalledLost"\);\n\s*sendMediaResult\(event\.senderId, request\.requestId, "receiver_stall_gave_up"\);/);
 });
@@ -1334,4 +1336,24 @@ test("media player: video length reaches the phone; no title over the picture", 
   assert.equal(gate.publishMediaDuration({ getMediaInformation: () => ({}), getDurationSec: () => NaN }), false);
   const source = fs.readFileSync(receiverSourcePath, "utf8");
   assert.match(source, /request\.media\.metadata = null/);
+});
+
+test("a still iPhone screen does not end casting while the phone keeps talking (diagnostics 31)", () => {
+  const gate = receiver();
+  const giveUp = gate.STALL_GIVE_UP_AFTER_MS;
+  // Picture frozen 30 s+, but sound and controls arrived a moment ago: keep casting.
+  assert.equal(gate.stallEndsAsConnectionLost(true, 100_000, 100_000 + 500), false);
+  assert.equal(gate.stallEndsAsConnectionLost(true, 100_000, 100_000 + giveUp - 1), false);
+  // Nothing at all from the phone for the give-up time: the phone is gone.
+  assert.equal(gate.stallEndsAsConnectionLost(true, 100_000, 100_000 + giveUp), true);
+  // Older phones without reconnect keep the waiting screen.
+  assert.equal(gate.stallEndsAsConnectionLost(false, 0, giveUp * 10), false);
+  assert.equal(gate.stallEndsAsConnectionLost(true, NaN, giveUp * 10), false);
+});
+
+test("every phone message counts as proof the phone is still there", () => {
+  const source = fs.readFileSync(receiverSourcePath, "utf8");
+  assert.match(source, /candidate\.onmessage = \(message\) => \{\n\s*if \(socket !== candidate\) return;\n\s*lastSenderMessageAt = performance\.now\(\);/);
+  // While the phone keeps talking the TV re-checks instead of giving up for good.
+  assert.match(source, /if \(!senderReconnect\) return;[\s\S]{0,400}const watchPhoneSilence = \(\) => \{[\s\S]{0,400}if \(!endStallIfPhoneSilent\(\)\) watchPhoneSilence\(\);[\s\S]{0,120}\}, MEDIA_LIVENESS_PROBE_MS\);/);
 });

@@ -622,6 +622,14 @@
   function shouldShowReconnectingScreen(firstRendered, receiverStopped, playbackAdvancedAt, now, stallThresholdMs) {
     return !!firstRendered && !receiverStopped && Number.isFinite(playbackAdvancedAt) && Number.isFinite(now) && Number.isFinite(stallThresholdMs) && now - playbackAdvancedAt >= stallThresholdMs;
   }
+  // Diagnostics 31: a picture that stops moving is not a lost phone. ReplayKit
+  // sends no new frames while the iPhone screen does not change, so the video
+  // freezes while the phone keeps sending sound and control messages. Only a
+  // phone that has also gone completely quiet for the give-up time is gone.
+  function stallEndsAsConnectionLost(senderReconnect, lastSenderMessageAt, now) {
+    return senderReconnect === true && Number.isFinite(lastSenderMessageAt) && Number.isFinite(now)
+      && now - lastSenderMessageAt >= STALL_GIVE_UP_AFTER_MS;
+  }
   function renderedCorrelationStrategy(hasExactMatch, hasOrderedMatch) {
     if (hasExactMatch) return "media_time";
     if (hasOrderedMatch) return "append_order";
@@ -887,7 +895,7 @@
     let seekCount = 0; let lastSeekKind = 0; let rateChanges = 0;
     let senderPaused = false; let pendingLiveJump = false; let mediaVisibilityHandler = null;
     let senderReconnect = false; let mediaReconnecting = false; let mediaReconnectRetryTimer; let mediaReconnectGiveUpTimer;
-    let mediaStopRequested = false; let livenessProbeTimer;
+    let mediaStopRequested = false; let livenessProbeTimer; let lastSenderMessageAt = performance.now();
     let source; let buffer; let audioBuffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingFragment = null; let lastAppendingSyncTimes = []; const syncPoints = []; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let recoverySeekStartedAt = 0; let healthySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let lastAudioType = 0; let audioTrimPending = false; let audioCreditSequence = 0; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
     if (activeReceiverPagehideListener && typeof global.removeEventListener === "function") {
       global.removeEventListener("pagehide", activeReceiverPagehideListener);
@@ -1008,18 +1016,33 @@
             // silent instead of closing, so the TV said "Unlock your iPhone".
             // A phone that supports reconnecting gives up after 15 s and a lock
             // ends sharing cleanly, so 30 s of silence means the phone is gone.
-            if (senderReconnect) {
+            // Diagnostics 31: silence means nothing at all from the phone, not a
+            // frozen picture (a still iPhone screen sends no new frames).
+            const endStallIfPhoneSilent = () => {
+              if (!stallEndsAsConnectionLost(senderReconnect, lastSenderMessageAt, performance.now())) return false;
               sendMediaResult(event.senderId, request.requestId, "receiver_stall_ended_as_connection_lost");
               mediaStopRequested = true;
               clearMediaReconnectTimers(); mediaReconnecting = false;
               try { socket && socket.close(); } catch (_) {}
               sendMediaResult(event.senderId, request.requestId, "receiver_stop_received");
               clearVideoForReceiverStop("lost");
-              return;
-            }
+              return true;
+            };
+            if (endStallIfPhoneSilent()) return;
             // Stage 3: give a clear next step; resumes by itself if media returns.
             showScreen("stalledLost");
             sendMediaResult(event.senderId, request.requestId, "receiver_stall_gave_up");
+            if (!senderReconnect) return;
+            // The phone is still talking: keep the session and check again, so a
+            // phone that goes quiet later still ends on Connection Lost.
+            const watchPhoneSilence = () => {
+              reconnectingScreenTimer = global.setTimeout(() => {
+                reconnectingScreenTimer = undefined;
+                if (receiverStopped || mediaReconnecting || lastPlayback.advancedAt !== stalledSince) return;
+                if (!endStallIfPhoneSilent()) watchPhoneSilence();
+              }, MEDIA_LIVENESS_PROBE_MS);
+            };
+            watchPhoneSilence();
           }, STALL_GIVE_UP_AFTER_MS - STALL_FULL_SCREEN_AFTER_MS);
         }, STALL_FULL_SCREEN_AFTER_MS);
       }, stallThresholdMs);
@@ -1566,6 +1589,7 @@
           };
           candidate.onmessage = (message) => {
             if (socket !== candidate) return;
+            lastSenderMessageAt = performance.now();
             if (typeof message.data === "string") {
               const control = parse(message.data); if (!control) { stop("protocol_error"); return; }
               if (control.type === "readyForMedia" && control.protocolVersion === PROTOCOL_VERSION && Object.keys(control).length === 2) {
@@ -2221,6 +2245,6 @@
     lifecycleDiagnostics.record("receiver_caf_start_returned");
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ chooseReplySender, validateMediaCapabilityQuery, mediaCapabilities, makeMediaCapabilityReport, publishMediaDuration, HEVC_PROBES, SCREEN_RTL_LANGUAGES, playerActive: () => playerActive, SCREEN_TRANSLATIONS, SCREEN_EXTRA_COPY_EN, resolveScreenLanguage, screenLanguage: () => screenLanguage, MEDIA_FEATURES, MEDIA_RECONNECT_GRACE_MS, MEDIA_RECONNECT_RETRY_MS, MEDIA_LIVENESS_PROBE_MS, RECOVERY_SEEK_WATCHDOG_MS, effectiveReceiverConfigHash, SCREEN_COPY, SCREEN_SHOWS_PHONE_CHIP, SCREEN_SHOWS_STEPS, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ chooseReplySender, validateMediaCapabilityQuery, mediaCapabilities, makeMediaCapabilityReport, publishMediaDuration, HEVC_PROBES, SCREEN_RTL_LANGUAGES, playerActive: () => playerActive, SCREEN_TRANSLATIONS, SCREEN_EXTRA_COPY_EN, resolveScreenLanguage, screenLanguage: () => screenLanguage, MEDIA_FEATURES, MEDIA_RECONNECT_GRACE_MS, MEDIA_RECONNECT_RETRY_MS, MEDIA_LIVENESS_PROBE_MS, RECOVERY_SEEK_WATCHDOG_MS, effectiveReceiverConfigHash, SCREEN_COPY, SCREEN_SHOWS_PHONE_CHIP, SCREEN_SHOWS_STEPS, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, stallEndsAsConnectionLost, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
