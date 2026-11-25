@@ -34,7 +34,7 @@ body.media-active #probe-video { background: #000; display: block; height: 100vh
 .chip-dot { width: 10px; height: 10px; border-radius: 50%; background: #5ccf8c; }
 .status-steps { list-style: none; margin: 4vh 0 0; padding: 0; display: flex; gap: 2.4vw; color: #c5d1e4; font-size: clamp(16px, 1.35vw, 26px); }
 .status-steps li { display: flex; align-items: center; gap: 12px; max-width: 18em; text-align: left; line-height: 1.35; }
-.status-steps li span { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 2em; height: 2em; border-radius: 50%; background: rgba(168, 201, 242, .16); color: #e7eefb; }
+.status-steps li > span:first-child { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 2em; height: 2em; border-radius: 50%; background: rgba(168, 201, 242, .16); color: #e7eefb; }
 @media (prefers-reduced-motion: reduce) { .status-content, .screen-enter { animation: none; } }
 .casting-visual { width: clamp(150px, 15vw, 300px); margin-bottom: 2.6vh; }
 .pause-icon { display: none; width: 18px; height: 22px; border-left: 6px solid #f4f6fc; border-right: 6px solid #f4f6fc; box-sizing: border-box; }
