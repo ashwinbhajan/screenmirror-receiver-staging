@@ -204,6 +204,8 @@
   // makes a dead connection fail fast (instead of hanging silently), so the
   // reconnect starts while the iPhone is still waiting for it (it waits 15 s).
   const MEDIA_LIVENESS_PROBE_MS = 3000;
+  // A recovery seek that has not finished after this long is released.
+  const RECOVERY_SEEK_WATCHDOG_MS = 4000;
   // Media connections whose iPhone opted in to visibility reports (it sends
   // senderFeatures only after seeing "mediaVisibility" above).
   const mediaVisibilityListeners = new Set();
@@ -788,7 +790,7 @@
     let senderPaused = false; let pendingLiveJump = false; let mediaVisibilityHandler = null;
     let senderReconnect = false; let mediaReconnecting = false; let mediaReconnectRetryTimer; let mediaReconnectGiveUpTimer;
     let mediaStopRequested = false; let livenessProbeTimer;
-    let source; let buffer; let audioBuffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingFragment = null; let lastAppendingSyncTimes = []; const syncPoints = []; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let healthySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let lastAudioType = 0; let audioTrimPending = false; let audioCreditSequence = 0; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
+    let source; let buffer; let audioBuffer; let socket; let firstKeyframe = false; let firstMediaAppended = false; let lastAppendingType = 0; let lastAppendingFragment = null; let lastAppendingSyncTimes = []; const syncPoints = []; let firstRendered = false; let playAttempted = false; let initialSeekRequested = false; let initialSeekCompleted = false; let recoverySeekPending = false; let recoverySeekStartedAt = 0; let healthySeekPending = false; let timeUpdated = false; let appendBacklogHighWatermark = 0; let appendedFragments = 0; let initAppendPending = false; let initAppendTimeout; let mediaAppendPending = false; let lastAudioType = 0; let audioTrimPending = false; let audioCreditSequence = 0; let playTimeout; let receiverStopped = false; let stallThresholdMs = 1500; let recoveryTailSeconds = 0.05; let recoveryMinimumLeadSeconds = 0.05; let recoveryTimeoutMs = 3000; let lastPlayback = { time: 0, advancedAt: performance.now(), recoveryAwaitingProgress: false, recoveryTimeout: undefined };
     if (activeReceiverPagehideListener && typeof global.removeEventListener === "function") {
       global.removeEventListener("pagehide", activeReceiverPagehideListener);
     }
@@ -1047,7 +1049,7 @@
       if (!initialSeekCompleted || recoverySeekPending || !firstRendered || !buffer || buffer.updating || !video.buffered || !video.buffered.length) return;
       const target = recoverySeekTarget(video.currentTime, video.buffered.start(0), video.buffered.end(0));
       if (target === null) return;
-      recoverySeekPending = true;
+      recoverySeekPending = true; recoverySeekStartedAt = performance.now();
       seekCount += 1; lastSeekKind = 2;
       sendMediaResult(event.senderId, request.requestId, "receiver_live_edge_recovery_seek");
       try { video.currentTime = target; } catch (_) { recoverySeekPending = false; sendMediaResult(event.senderId, request.requestId, "recovery_seek_failed"); }
@@ -1074,7 +1076,7 @@
             && (video.currentTime < start || video.currentTime > end)) {
           // Playhead is in a gap (no media there): jump to the newest video;
           // the "seeked" handler calls play() because the element is paused.
-          recoverySeekPending = true;
+          recoverySeekPending = true; recoverySeekStartedAt = performance.now();
           seekCount += 1; lastSeekKind = 4;
           video.currentTime = Math.max(start + 0.05, end - 0.05);
         } else {
@@ -1087,6 +1089,17 @@
     };
     // After the iPhone resumes, the TV holds old video up to the pause and new
     // video after it. Jump straight to the newest video instead of catching up.
+    // Every recovery path waits for the previous seek to finish. If a seek
+    // never finishes (diagnostics 11: picture frozen for 2+ min after a pause,
+    // no recovery attempted), release it so recovery can jump to live again.
+    const releaseStuckRecoverySeek = () => {
+      if (!recoverySeekPending || receiverStopped) return;
+      if (performance.now() - recoverySeekStartedAt < RECOVERY_SEEK_WATCHDOG_MS) return;
+      recoverySeekPending = false;
+      healthySeekPending = false;
+      try { healthyCatchup.completeSeek(mediaRun); } catch (_) {}
+      sendMediaResult(event.senderId, request.requestId, "receiver_recovery_seek_watchdog_released");
+    };
     const jumpToLiveAfterResume = () => {
       if (!pendingLiveJump || receiverStopped || recoverySeekPending || !video.buffered || !video.buffered.length) return;
       const last = video.buffered.length - 1;
@@ -1095,7 +1108,7 @@
       if (video.currentTime >= start && end - video.currentTime < 1) { pendingLiveJump = false; return; }
       if (video.currentTime >= start) return;
       pendingLiveJump = false;
-      recoverySeekPending = true;
+      recoverySeekPending = true; recoverySeekStartedAt = performance.now();
       seekCount += 1; lastSeekKind = 5;
       sendMediaResult(event.senderId, request.requestId, "receiver_resume_live_jump");
       try { video.currentTime = Math.max(start + 0.05, end - 0.05); } catch (_) { recoverySeekPending = false; }
@@ -1110,7 +1123,7 @@
       if (target === null || target - video.currentTime < 0.02) return;
       playbackTelemetry("receiver_playback_stall_detected");
       sendMediaResult(event.senderId, request.requestId, "receiver_playback_stall_detected");
-      recoverySeekPending = true;
+      recoverySeekPending = true; recoverySeekStartedAt = performance.now();
       seekCount += 1; lastSeekKind = 3;
       lastPlayback.recoveryAwaitingProgress = true;
       sendMediaResult(event.senderId, request.requestId, "receiver_live_edge_recovery_seek");
@@ -1146,7 +1159,7 @@
         renderAgeMs: lastRenderAtMs === null ? null : now - lastRenderAtMs
       });
       if (target === null) return;
-      recoverySeekPending = true;
+      recoverySeekPending = true; recoverySeekStartedAt = performance.now();
       healthySeekPending = true;
       seekCount += 1; lastSeekKind = 4;
       playbackTelemetry("healthy_live_edge_catchup_requested");
@@ -1332,6 +1345,7 @@
             }
             ensurePlayablePosition();
             attemptPlay();
+            releaseStuckRecoverySeek();
             jumpToLiveAfterResume();
             recoverPlaybackPosition();
             detectPlaybackStall();
@@ -2086,6 +2100,6 @@
     lifecycleDiagnostics.record("receiver_caf_start_returned");
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ playerActive: () => playerActive, SCREEN_TRANSLATIONS, SCREEN_EXTRA_COPY_EN, resolveScreenLanguage, screenLanguage: () => screenLanguage, MEDIA_FEATURES, MEDIA_RECONNECT_GRACE_MS, MEDIA_RECONNECT_RETRY_MS, MEDIA_LIVENESS_PROBE_MS, effectiveReceiverConfigHash, SCREEN_COPY, SCREEN_SHOWS_PHONE_CHIP, SCREEN_SHOWS_STEPS, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ playerActive: () => playerActive, SCREEN_TRANSLATIONS, SCREEN_EXTRA_COPY_EN, resolveScreenLanguage, screenLanguage: () => screenLanguage, MEDIA_FEATURES, MEDIA_RECONNECT_GRACE_MS, MEDIA_RECONNECT_RETRY_MS, MEDIA_LIVENESS_PROBE_MS, RECOVERY_SEEK_WATCHDOG_MS, effectiveReceiverConfigHash, SCREEN_COPY, SCREEN_SHOWS_PHONE_CHIP, SCREEN_SHOWS_STEPS, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);

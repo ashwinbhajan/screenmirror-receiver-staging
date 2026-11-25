@@ -1234,3 +1234,17 @@ test("photos and videos: with no phone, a photo returns the TV home; a playing v
   runNoSender();
   assert.equal(s.contextStops(), 1, "finished: back to the TV home screen");
 });
+
+test("a recovery seek that never finishes cannot freeze the picture forever", () => {
+  const gate = receiver();
+  assert.equal(gate.RECOVERY_SEEK_WATCHDOG_MS, 4000);
+  const source = fs.readFileSync(receiverSourcePath, "utf8");
+  // Every place that starts a recovery seek records when it started.
+  const starts = source.match(/recoverySeekPending = true;/g) || [];
+  const stamped = source.match(/recoverySeekPending = true; recoverySeekStartedAt = performance\.now\(\);/g) || [];
+  assert.ok(starts.length >= 5);
+  assert.equal(stamped.length, starts.length);
+  // The watchdog runs on every append, before the recovery paths it unblocks.
+  assert.match(source, /releaseStuckRecoverySeek\(\);\n\s*jumpToLiveAfterResume\(\);\n\s*recoverPlaybackPosition\(\);\n\s*detectPlaybackStall\(\);/);
+  assert.match(source, /performance\.now\(\) - recoverySeekStartedAt < RECOVERY_SEEK_WATCHDOG_MS\) return;\n\s*recoverySeekPending = false;/);
+});
