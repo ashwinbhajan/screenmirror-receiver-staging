@@ -1274,3 +1274,12 @@ test("a silent connection after the phone's Wi-Fi drops ends on Connection Lost,
   // Older phones keep the previous waiting screen.
   assert.match(source, /showScreen\("stalledLost"\);\n\s*sendMediaResult\(event\.senderId, request\.requestId, "receiver_stall_gave_up"\);/);
 });
+
+test("the waiting screen no longer tells the person to unlock the iPhone (owner: generic message)", () => {
+  const gate = receiver();
+  assert.match(gate.SCREEN_COPY.stalledLost[1], /same Wi‑Fi/);
+  assert.doesNotMatch(gate.SCREEN_COPY.stalledLost[1], /Unlock/);
+  for (const [lang, copy] of Object.entries(gate.SCREEN_TRANSLATIONS)) {
+    assert.ok(copy.stalledLost[1].includes("Wi‑Fi") || copy.stalledLost[1].includes("wifi") || copy.stalledLost[1].includes("WLAN"), lang);
+  }
+});
