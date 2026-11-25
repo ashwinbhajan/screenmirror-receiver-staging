@@ -40,3 +40,17 @@ body.media-active #probe-video { background: #000; display: block; height: 100vh
 .pause-icon { display: none; width: 18px; height: 22px; border-left: 6px solid #f4f6fc; border-right: 6px solid #f4f6fc; box-sizing: border-box; }
 .stall-badge.paused .stall-spinner { display: none; }
 .stall-badge.paused .pause-icon { display: inline-block; }
+
+/* Photos, videos and video links (Cast framework player), in Screen Mirror colours. */
+cast-media-player {
+  display: none; position: fixed; inset: 0; z-index: 4;
+  --background-color: #090e18;
+  --font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+  --progress-color: #4caf78;
+  --logo-image: url("./assets/screen-mirror-app-icon.png");
+  --splash-image: url("./assets/screen-mirror-app-icon.png");
+  --splash-size: 22vh;
+  --watermark-image: none;
+}
+body.player-active cast-media-player { display: block; }
+body.player-active #probe-video, body.player-active .stall-badge { display: none; }

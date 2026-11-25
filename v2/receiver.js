@@ -87,7 +87,9 @@
     stalledLost: Object.freeze(["Waiting for Your iPhone", "Unlock your iPhone to continue. If it doesn’t come back, tap Cast to TV again."]),
     // The TV never reached the iPhone (first picture never arrived): almost always
     // a network that keeps devices apart (guest/office Wi‑Fi, VPN, different band).
-    unreachable: Object.freeze(["Can’t Reach Your iPhone", "Your iPhone and TV need to be on the same Wi‑Fi. Guest and office networks often block this."])
+    unreachable: Object.freeze(["Can’t Reach Your iPhone", "Your iPhone and TV need to be on the same Wi‑Fi. Guest and office networks often block this."]),
+    // A photo, video or video link sent from the iPhone could not be played here.
+    mediaError: Object.freeze(["Can’t Play This", "This photo or video can’t be shown on this TV. Try another one on your iPhone."])
   });
   // Small "iPhone connected" chip and the how-to steps, per screen.
   const SCREEN_SHOWS_PHONE_CHIP = Object.freeze(["connected", "waitingForStart", "reconnecting"]);
@@ -149,7 +151,7 @@
       noSenderTimer = null;
       let senders = 1;
       try { senders = context && typeof context.getSenders === "function" ? context.getSenders().length : 1; } catch (_) {}
-      if (senders === 0 && currentScreen !== "playing") {
+      if (senders === 0 && currentScreen !== "playing" && !playerActive) {
         try { if (context && typeof context.stop === "function") context.stop(); } catch (_) {}
       }
     }, NO_SENDER_RETURN_TO_HOME_MS);
@@ -168,6 +170,54 @@
         if (context && typeof context.stop === "function") context.stop();
       } catch (_) {}
     }, IDLE_RETURN_TO_HOME_MS);
+  }
+  // Photos, videos and video links (Gallery, Cast Video, Cast Playlist) play
+  // inside this TV app with the Cast framework's standard player — the same
+  // LOAD messages the iPhone sends to Google's generic player today. Mirroring
+  // is a separate path; the two never run at once (starting one stops the other).
+  let playerManager = null;
+  let playerActive = false;
+  let stopMirroringForPlayer = null;
+  function setPlayerActive(active, screenAfter) {
+    if (playerActive === active) return;
+    playerActive = active;
+    try { document.body.classList.toggle("player-active", active); } catch (_) {}
+    if (active) {
+      clearConnectedWithoutStartTimer(); cancelNoSenderTimer(); cancelIdleReturnToHomeTimer();
+      setBadge(null);
+      currentScreen = "player";
+      receiverReadinessState = receiverReadinessStateForScreen("player");
+      if (ui) ui.panel.hidden = true;
+    } else {
+      showScreen(screenAfter || "ready");
+    }
+  }
+  function stopPlayerForMirroring() {
+    if (!playerActive) return;
+    try { if (playerManager && typeof playerManager.stop === "function") playerManager.stop(); } catch (_) {}
+    setPlayerActive(false, "connected");
+  }
+  function installMediaPlayer(framework) {
+    if (!context || typeof context.getPlayerManager !== "function" || !framework || !framework.messages || !framework.events) return;
+    try {
+      playerManager = context.getPlayerManager();
+      if (!playerManager) return;
+      playerManager.setMessageInterceptor(framework.messages.MessageType.LOAD, (request) => {
+        // A cast is running: end it first, exactly as Google's player did
+        // when it replaced this app on the TV.
+        if (typeof stopMirroringForPlayer === "function") { try { stopMirroringForPlayer(); } catch (_) {} }
+        setPlayerActive(true);
+        return request;
+      });
+      const events = framework.events.EventType;
+      playerManager.addEventListener(events.ERROR, () => {
+        if (playerActive) setPlayerActive(false, "mediaError");
+      });
+      // Stop from the iPhone (or the TV remote): back to the ready screen.
+      playerManager.addEventListener(events.REQUEST_STOP, () => {
+        if (playerActive) setPlayerActive(false, "ready");
+      });
+    } catch (_) { playerManager = null; }
   }
   function showScreen(state) {
     currentScreen = state;
@@ -809,6 +859,14 @@
       sendMediaResult(event.senderId, request.requestId, "receiver_idle_screen_shown");
       if (screen === "stopped") sendMediaResult(event.senderId, request.requestId, "receiver_casting_stopped_screen_shown");
       if (screen === "lost" || screen === "unreachable") sendMediaResult(event.senderId, request.requestId, "receiver_connection_lost_screen_shown");
+    };
+    // A photo/video from the iPhone replaces a running cast (as Google's
+    // player did when it took over the TV): end this cast cleanly first.
+    stopMirroringForPlayer = () => {
+      if (receiverStopped || mediaRun !== activeMediaRun) return;
+      sendMediaResult(event.senderId, request.requestId, "receiver_mirroring_replaced_by_player");
+      try { socket && socket.close(1000, "player"); } catch (_) {}
+      clearVideoForReceiverStop("ready");
     };
     const stop = (result) => { clearInitAppendTimeout(); clearPlayTimeout(); clearPlaybackSampleTimer(); try { socket && socket.close(); } catch (_) {} sendMediaResult(event.senderId, request.requestId, result); };
     const safePlayRejection = (error) => {
@@ -1508,6 +1566,7 @@
     }
     const media = event && validateMediaStart(event.data);
     if (media) {
+      stopPlayerForMirroring();
       lifecycleDiagnostics.mediaRequested();
       emitReceiverStartup(event, media);
       sendReceiverDiagnostic(event, media, `receiver_page_loaded_revision_${RECEIVER_REVISION}`);
@@ -1811,7 +1870,7 @@
         // never interrupt an already-playing cast or override a more
         // specific in-progress state.
         cancelNoSenderTimer();
-        if (receiverReadinessState !== "mirroring" && ui && ui.panel.hidden === false) {
+        if (receiverReadinessState !== "mirroring" && !playerActive && ui && ui.panel.hidden === false) {
           showScreen("connected");
           clearConnectedWithoutStartTimer();
           connectedWithoutStartTimer = global.setTimeout(() => {
@@ -1823,7 +1882,7 @@
       if (types.SENDER_DISCONNECTED) context.addEventListener(types.SENDER_DISCONNECTED, () => {
         let senders = 1;
         try { senders = typeof context.getSenders === "function" ? context.getSenders().length : 1; } catch (_) {}
-        if (senders === 0 && currentScreen !== "playing") scheduleNoSenderReturnToHome();
+        if (senders === 0 && currentScreen !== "playing" && !playerActive) scheduleNoSenderReturnToHome();
       });
     }
     try {
@@ -1844,12 +1903,13 @@
     // This receiver streams raw MSE video over its own namespace and never loads a CAF
     // media session, so CAF's default no-media idle shutdown (~300s) must be disabled here.
     options.disableIdleTimeout = true;
+    installMediaPlayer(global.cast.framework);
     lifecycleDiagnostics.optionsSnapshot(options);
     lifecycleDiagnostics.record("receiver_caf_start_requested");
     context.start(options);
     lifecycleDiagnostics.record("receiver_caf_start_returned");
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ MEDIA_FEATURES, effectiveReceiverConfigHash, SCREEN_COPY, SCREEN_SHOWS_PHONE_CHIP, SCREEN_SHOWS_STEPS, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ playerActive: () => playerActive, MEDIA_FEATURES, effectiveReceiverConfigHash, SCREEN_COPY, SCREEN_SHOWS_PHONE_CHIP, SCREEN_SHOWS_STEPS, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);

@@ -855,3 +855,105 @@ test("media-connection visibility is opt-in by the iPhone", () => {
   assert.match(source, /control\.type === "senderFeatures" && control\.protocolVersion === PROTOCOL_VERSION\s*\n\s*&& Object\.keys\(control\)\.length === 3/);
   assert.match(source, /type: "receiverVisibility", protocolVersion: PROTOCOL_VERSION, visibility/);
 });
+
+// TV session with a fake Cast player, for photos/videos inside our TV app (P3).
+async function playerSession() {
+  const messages = []; const sources = []; const sockets = []; const nodes = {}; const classes = new Set(); const timers = [];
+  let receiverListener; let loadInterceptor; const playerEvents = {}; const systemEvents = {}; let stops = 0;
+  const video = { buffered: { length: 0 }, currentTime: 0, playbackRate: 1, pause() {}, load() {}, removeAttribute() {},
+    addEventListener() {}, requestVideoFrameCallback() { return 1; }, cancelVideoFrameCallback() {} };
+  class MediaSource {
+    static isTypeSupported() { return true; }
+    constructor() { this.listeners = {}; sources.push(this); }
+    addEventListener(name, callback) { this.listeners[name] = callback; }
+    addSourceBuffer() { return { listeners: {}, addEventListener(name, callback) { this.listeners[name] = callback; }, appendBuffer() {} }; }
+  }
+  class WebSocket { constructor() { this.readyState = 1; this.closed = null; sockets.push(this); } send() {} close(code, reason) { this.closed = { code, reason }; } }
+  const playerManager = {
+    setMessageInterceptor(type, callback) { if (type === "LOAD") loadInterceptor = callback; },
+    addEventListener(type, callback) { playerEvents[type] = callback; },
+    stop() { stops += 1; }
+  };
+  const context = { ArrayBuffer, Uint8Array, DataView, TextEncoder, performance: { now: () => 0 },
+    setTimeout: (callback, ms) => { timers.push({ callback, ms }); return timers.length; }, clearTimeout(id) { if (id) timers[id - 1] = null; },
+    setInterval: () => 1, clearInterval() {}, MediaSource, WebSocket,
+    document: { readyState: "complete", getElementById: (id) => id === "probe-video" ? video : (nodes[id] ||= {}), addEventListener() {},
+      body: { classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name), toggle: (name, on) => on ? classes.add(name) : classes.delete(name) } } },
+    cast: { framework: {
+      CastReceiverContext: { getInstance: () => ({ addEventListener: (name, callback) => { systemEvents[name] = callback; }, addCustomMessageListener: (_, callback) => { receiverListener = callback; }, start() {}, getPlayerManager: () => playerManager, getSenders: () => [], sendCustomMessage: (_, sender, message) => messages.push({ sender, ...message }) }) },
+      CastReceiverOptions: function () {},
+      messages: { MessageType: { LOAD: "LOAD" } },
+      events: { EventType: { ERROR: "ERROR", REQUEST_STOP: "REQUEST_STOP" } },
+      system: { EventType: { READY: "ready", SENDER_CONNECTED: "sender_connected", SENDER_DISCONNECTED: "sender_disconnected" }, MessageType: { JSON: "JSON" } } } } };
+  context.URL = class extends URL { static createObjectURL() { return "blob:test"; } };
+  vm.runInNewContext(fs.readFileSync(receiverSourcePath, "utf8"), context);
+  systemEvents.ready(); systemEvents.sender_connected({ senderId: "sender" });
+  const startMirroring = async () => {
+    sources[0].listeners.sourceopen && sources[0].listeners.sourceopen();
+    await new Promise(setImmediate);
+    receiverListener({ senderId: "sender", data: { type: "startMedia", protocolVersion: 2, requestId: "r", endpoint: "ws://192.168.1.1:1234/" + "a".repeat(64) } });
+    await new Promise(setImmediate); sources[sources.length - 1].listeners.sourceopen();
+  };
+  return { gate: context.ScreenMirrorReceiverCapabilityGate, nodes, classes, sockets, messages, timers, playerEvents, startMirroring,
+    load: (contentType) => loadInterceptor({ media: { contentId: "http://192.168.1.2/a", contentType } }),
+    stops: () => stops };
+}
+
+test("photos and videos: a LOAD shows our player over the idle screen", async () => {
+  const s = await playerSession();
+  assert.equal(s.nodes["status-title"].textContent, "Connected");
+  const request = s.load("image/jpeg");
+  assert.equal(request.media.contentType, "image/jpeg", "the request is passed through unchanged");
+  assert.ok(s.classes.has("player-active"));
+  assert.equal(s.nodes["idle-screen"].hidden, true);
+  assert.equal(s.gate.playerActive(), true);
+  // Waiting-for-start timer no longer replaces anything on screen.
+  for (const timer of s.timers) if (timer && timer.ms === s.gate.CONNECTED_WITHOUT_START_MS) timer.callback();
+  assert.equal(s.nodes["idle-screen"].hidden, true);
+});
+
+test("photos and videos: an unplayable item shows a clear message", async () => {
+  const s = await playerSession();
+  s.load("video/mp4");
+  s.playerEvents.ERROR({});
+  assert.equal(s.gate.playerActive(), false);
+  assert.equal(s.nodes["status-title"].textContent, "Can’t Play This");
+  assert.equal(s.nodes["idle-screen"].hidden, false);
+});
+
+test("photos and videos: Stop from the iPhone returns to Ready to Cast", async () => {
+  const s = await playerSession();
+  s.load("image/jpeg");
+  s.playerEvents.REQUEST_STOP({});
+  assert.equal(s.gate.playerActive(), false);
+  assert.equal(s.nodes["status-title"].textContent, "Ready to Cast");
+});
+
+test("photos and videos: Cast to TV during a slideshow stops the player first", async () => {
+  const s = await playerSession();
+  s.load("image/jpeg");
+  await s.startMirroring();
+  assert.equal(s.stops(), 1);
+  assert.equal(s.gate.playerActive(), false);
+  assert.ok(!s.classes.has("player-active"));
+  assert.equal(s.sockets.length, 1, "mirroring starts normally");
+});
+
+test("photos and videos: a photo during a cast ends the cast cleanly first", async () => {
+  const s = await playerSession();
+  await s.startMirroring();
+  s.sockets[0].onopen();
+  s.load("image/jpeg");
+  assert.deepEqual({ ...s.sockets[0].closed }, { code: 1000, reason: "player" });
+  assert.ok(s.messages.some((m) => m.result === "receiver_mirroring_replaced_by_player"));
+  assert.equal(s.gate.playerActive(), true);
+  assert.ok(s.classes.has("player-active"));
+  assert.ok(!s.classes.has("media-active"), "mirroring video layer removed");
+});
+
+test("photos and videos: no player in the page never breaks mirroring", () => {
+  // The other harnesses have no getPlayerManager; they keep passing unchanged.
+  const source = fs.readFileSync(receiverSourcePath, "utf8");
+  assert.match(source, /typeof context\.getPlayerManager !== "function"/);
+  assert.match(source, /if \(media\) \{\n\s*stopPlayerForMirroring\(\);/);
+});
