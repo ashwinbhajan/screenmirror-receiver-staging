@@ -314,6 +314,14 @@
     try { if (playerManager && typeof playerManager.stop === "function") playerManager.stop(); } catch (_) {}
     setPlayerActive(false, "connected");
   }
+  function publishMediaDuration(manager) {
+    const info = manager && typeof manager.getMediaInformation === "function" ? manager.getMediaInformation() : null;
+    const duration = manager && typeof manager.getDurationSec === "function" ? manager.getDurationSec() : NaN;
+    if (!info || (info.duration > 0) || !(Number.isFinite(duration) && duration > 0)) return false;
+    info.duration = duration;
+    if (typeof manager.setMediaInformation === "function") manager.setMediaInformation(info, true);
+    return true;
+  }
   function installMediaPlayer(framework) {
     if (!context || typeof context.getPlayerManager !== "function" || !framework || !framework.messages || !framework.events) return;
     try {
@@ -323,10 +331,16 @@
         // A cast is running: end it first, exactly as Google's player did
         // when it replaced this app on the TV.
         if (typeof stopMirroringForPlayer === "function") { try { stopMirroringForPlayer(); } catch (_) {} }
+        // Owner 2026-11-25: no "Gallery Video" title or subtitle over the picture.
+        try { if (request && request.media && request.media.metadata) request.media.metadata = null; } catch (_) {}
         setPlayerActive(true);
         return request;
       });
       const events = framework.events.EventType;
+      // Report the video length so the iPhone can show its scrubber.
+      if (events.PLAYER_LOAD_COMPLETE) playerManager.addEventListener(events.PLAYER_LOAD_COMPLETE, () => {
+        try { publishMediaDuration(playerManager); } catch (_) {}
+      });
       playerManager.addEventListener(events.ERROR, (errorEvent) => {
         if (!playerActive) return;
         // A slideshow sends the next item while the previous one may still be
@@ -425,6 +439,30 @@
     if (documentState === "hidden" || cafVisibility === "NOT_VISIBLE" || cafStandby === "STANDBY") return "hidden";
     if (documentState === "visible" || cafVisibility === "VISIBLE") return "visible";
     return "unknown";
+  }
+  // Media capability (opt-in, 2026-11-25). Phones that ask learn whether this
+  // TV plays iPhone (HEVC) video directly, so they can skip re-encoding it.
+  // Older phones never ask; older TV apps ignore the question.
+  function validateMediaCapabilityQuery(data) {
+    const message = parse(data);
+    if (!message || Object.keys(message).length !== 3 || message.type !== "receiverMediaCapabilityQuery" ||
+        message.protocolVersion !== PROTOCOL_VERSION || typeof message.requestId !== "string" ||
+        !REQUEST_ID.test(message.requestId)) return null;
+    return message;
+  }
+  // HEVC strings: Main (8-bit SDR), Main 10 (HDR), and 4K at level 5.1.
+  const HEVC_PROBES = Object.freeze({
+    hevc: ["video/mp4", "hvc1.1.6.L120.90", 1920, 1080, 30],
+    hevcHDR: ["video/mp4", "hvc1.2.4.L120.90", 1920, 1080, 30],
+    hevc4K: ["video/mp4", "hvc1.1.6.L153.90", 3840, 2160, 30]
+  });
+  function mediaCapabilities(canDisplay) {
+    const check = (args) => { try { return canDisplay(...args) === true; } catch (_) { return false; } };
+    const hevc = check(HEVC_PROBES.hevc);
+    return { hevc, hevcHDR: hevc && check(HEVC_PROBES.hevcHDR), hevc4K: hevc && check(HEVC_PROBES.hevc4K) };
+  }
+  function makeMediaCapabilityReport(requestId, video) {
+    return { type: "receiverMediaCapabilityReport", protocolVersion: PROTOCOL_VERSION, requestId, video };
   }
   function makeVisibilityReport(requestId, visibility) {
     return { type: "receiverVisibilityReport", protocolVersion: PROTOCOL_VERSION, requestId, visibility };
@@ -1795,6 +1833,16 @@
     }
   }
   function receiverMessage(event) {
+    const capabilityQuery = event && validateMediaCapabilityQuery(event.data);
+    if (capabilityQuery) {
+      if (typeof event.senderId === "string") {
+        const canDisplay = (mime, codecs, width, height, fps) => !!(context && typeof context.canDisplayType === "function"
+          && context.canDisplayType(mime, codecs, width, height, fps));
+        context.sendCustomMessage(NAMESPACE, currentReplySender(event.senderId),
+          makeMediaCapabilityReport(capabilityQuery.requestId, mediaCapabilities(canDisplay)));
+      }
+      return;
+    }
     const visibilityQuery = event && validateVisibilityQuery(event.data);
     if (visibilityQuery) {
       if (typeof event.senderId === "string") {
@@ -2173,6 +2221,6 @@
     lifecycleDiagnostics.record("receiver_caf_start_returned");
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ chooseReplySender, SCREEN_RTL_LANGUAGES, playerActive: () => playerActive, SCREEN_TRANSLATIONS, SCREEN_EXTRA_COPY_EN, resolveScreenLanguage, screenLanguage: () => screenLanguage, MEDIA_FEATURES, MEDIA_RECONNECT_GRACE_MS, MEDIA_RECONNECT_RETRY_MS, MEDIA_LIVENESS_PROBE_MS, RECOVERY_SEEK_WATCHDOG_MS, effectiveReceiverConfigHash, SCREEN_COPY, SCREEN_SHOWS_PHONE_CHIP, SCREEN_SHOWS_STEPS, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ chooseReplySender, validateMediaCapabilityQuery, mediaCapabilities, makeMediaCapabilityReport, publishMediaDuration, HEVC_PROBES, SCREEN_RTL_LANGUAGES, playerActive: () => playerActive, SCREEN_TRANSLATIONS, SCREEN_EXTRA_COPY_EN, resolveScreenLanguage, screenLanguage: () => screenLanguage, MEDIA_FEATURES, MEDIA_RECONNECT_GRACE_MS, MEDIA_RECONNECT_RETRY_MS, MEDIA_LIVENESS_PROBE_MS, RECOVERY_SEEK_WATCHDOG_MS, effectiveReceiverConfigHash, SCREEN_COPY, SCREEN_SHOWS_PHONE_CHIP, SCREEN_SHOWS_STEPS, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);

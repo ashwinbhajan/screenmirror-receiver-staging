@@ -1305,3 +1305,33 @@ test("TV languages: 39 languages including Indian, East Asian and right-to-left 
     assert.match(gate.SCREEN_TRANSLATIONS[language].ready[1], /«⁨Cast to TV⁩»/, language);
   }
 });
+
+test("media capability: opt-in question, HEVC answer, never in the ready report", () => {
+  const gate = receiver();
+  assert.ok(gate.validateMediaCapabilityQuery(JSON.stringify({ type: "receiverMediaCapabilityQuery", protocolVersion: 2, requestId: "cap_1" })));
+  assert.equal(gate.validateMediaCapabilityQuery(JSON.stringify({ type: "receiverMediaCapabilityQuery", protocolVersion: 2, requestId: "cap_1", extra: 1 })), null);
+  const all = gate.mediaCapabilities(() => true);
+  assert.deepEqual({ ...all }, { hevc: true, hevcHDR: true, hevc4K: true });
+  const sdrOnly = gate.mediaCapabilities((mime, codecs) => codecs === gate.HEVC_PROBES.hevc[1]);
+  assert.deepEqual({ ...sdrOnly }, { hevc: true, hevcHDR: false, hevc4K: false });
+  const none = gate.mediaCapabilities(() => { throw new Error("no"); });
+  assert.deepEqual({ ...none }, { hevc: false, hevcHDR: false, hevc4K: false });
+  const report = gate.makeMediaCapabilityReport("cap_1", sdrOnly);
+  assert.equal(report.type, "receiverMediaCapabilityReport");
+  // Old phones check the ready report strictly: it must not grow.
+  const ready = gate.makeReadyReport("ready_1", "idle", true);
+  assert.deepEqual(Object.keys(ready).sort(), ["audioCapabilities", "protocolVersion", "receiverRevision", "receiverState", "receiverVersion", "requestId", "type"]);
+});
+
+test("media player: video length reaches the phone; no title over the picture", () => {
+  const gate = receiver();
+  let published = null;
+  const manager = { getMediaInformation: () => ({ duration: 0 }), getDurationSec: () => 312.5, setMediaInformation: (info, broadcast) => { published = { info, broadcast }; } };
+  assert.equal(gate.publishMediaDuration(manager), true);
+  assert.equal(published.info.duration, 312.5);
+  assert.equal(published.broadcast, true);
+  assert.equal(gate.publishMediaDuration({ getMediaInformation: () => ({ duration: 40 }), getDurationSec: () => 40 }), false);
+  assert.equal(gate.publishMediaDuration({ getMediaInformation: () => ({}), getDurationSec: () => NaN }), false);
+  const source = fs.readFileSync(receiverSourcePath, "utf8");
+  assert.match(source, /request\.media\.metadata = null/);
+});
