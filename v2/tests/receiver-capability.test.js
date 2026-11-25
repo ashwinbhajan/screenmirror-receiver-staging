@@ -1248,3 +1248,21 @@ test("a recovery seek that never finishes cannot freeze the picture forever", ()
   assert.match(source, /releaseStuckRecoverySeek\(\);\n\s*jumpToLiveAfterResume\(\);\n\s*recoverPlaybackPosition\(\);\n\s*detectPlaybackStall\(\);/);
   assert.match(source, /performance\.now\(\) - recoverySeekStartedAt < RECOVERY_SEEK_WATCHDOG_MS\) return;\n\s*recoverySeekPending = false;/);
 });
+
+test("after the phone comes back from another app, replies reach its new address", () => {
+  const gate = receiver();
+  const at = new Map([["old", 1], ["other", 5], ["new", 9]]);
+  // Original phone still connected: keep answering it.
+  assert.equal(gate.chooseReplySender("old", ["old", "new"], at), "old");
+  // Original gone: answer the most recently connected phone.
+  assert.equal(gate.chooseReplySender("old", ["other", "new"], at), "new");
+  // Unknown connection times: fall back to the last listed phone.
+  assert.equal(gate.chooseReplySender("old", ["a", "b"], new Map()), "b");
+  // Sender list unavailable or empty: unchanged.
+  assert.equal(gate.chooseReplySender("old", null, at), "old");
+  assert.equal(gate.chooseReplySender("old", [], at), "old");
+  // Every reply path about the cast goes through the current-address lookup.
+  const source = fs.readFileSync(receiverSourcePath, "utf8");
+  assert.match(source, /context\.sendCustomMessage\(NAMESPACE, currentReplySender\(senderId\), payload\)/);
+  assert.match(source, /context\.sendCustomMessage\(NAMESPACE, currentReplySender\(event\.senderId\), \{ type: "firstRenderedFrame"/);
+});

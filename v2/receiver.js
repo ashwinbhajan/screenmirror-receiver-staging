@@ -702,6 +702,28 @@
     if (keys.length === 5 && message.audioCodec !== "mp4a.40.2") return null;
     return message;
   }
+  // A phone that leaves the app and comes back gets a new Cast sender address
+  // (diagnostics 18/19: "Casting Stopped" went to the old one, so the phone
+  // never heard it and disconnected). Keep the original while it is connected,
+  // otherwise answer the most recently connected phone.
+  function chooseReplySender(original, connectedIds, connectedAt) {
+    if (!Array.isArray(connectedIds) || connectedIds.length === 0 || connectedIds.includes(original)) return original;
+    let best = connectedIds[connectedIds.length - 1];
+    let bestAt = -Infinity;
+    for (const id of connectedIds) {
+      const at = connectedAt && connectedAt.has(id) ? connectedAt.get(id) : -Infinity;
+      if (at > bestAt) { best = id; bestAt = at; }
+    }
+    return best;
+  }
+  function currentReplySender(original) {
+    let ids = null;
+    try {
+      const senders = typeof context.getSenders === "function" ? context.getSenders() : null;
+      if (Array.isArray(senders)) ids = senders.map((sender) => sender && sender.id).filter((id) => typeof id === "string" && id);
+    } catch (_) { ids = null; }
+    return chooseReplySender(original, ids, senderConnections);
+  }
   function sendMediaResult(senderId, requestId, result, telemetry, observedReceiverTime) {
     const payload = { type: "mediaResult", protocolVersion: PROTOCOL_VERSION, requestId, receiverVersion: RECEIVER_VERSION, result };
     if (["receiver_first_message_received", "receiver_auth_validation_passed", "receiver_media_ready_received"].includes(result)
@@ -710,7 +732,7 @@
     }
     if (Number.isFinite(observedReceiverTime)) payload.receiverUptimeMs = observedReceiverTime;
     if (telemetry) payload.telemetry = telemetry;
-    context.sendCustomMessage(NAMESPACE, senderId, payload);
+    context.sendCustomMessage(NAMESPACE, currentReplySender(senderId), payload);
   }
   function sendReceiverDiagnostic(event, request, result) {
     if (!event || !event.senderId || !request || typeof request.requestId !== "string") return;
@@ -832,7 +854,7 @@
       firstRendered = true;
       const presentedFrames = Math.max(1, Math.floor(metadata.presentedFrames));
       sendMediaResult(event.senderId, request.requestId, `first_frame_callback_presented_${presentedFrames}`);
-      context.sendCustomMessage(NAMESPACE, event.senderId, { type: "firstRenderedFrame", protocolVersion: PROTOCOL_VERSION, requestId: request.requestId, receiverVersion: RECEIVER_VERSION, appendBacklogHighWatermark });
+      context.sendCustomMessage(NAMESPACE, currentReplySender(event.senderId), { type: "firstRenderedFrame", protocolVersion: PROTOCOL_VERSION, requestId: request.requestId, receiverVersion: RECEIVER_VERSION, appendBacklogHighWatermark });
     };
     const pacing = createFramePacingSummary((result) => sendMediaResult(event.senderId, request.requestId, result));
     const correlations = createFrameCorrelationTracker(flowGeneration,
@@ -2100,6 +2122,6 @@
     lifecycleDiagnostics.record("receiver_caf_start_returned");
 
   }
-  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ playerActive: () => playerActive, SCREEN_TRANSLATIONS, SCREEN_EXTRA_COPY_EN, resolveScreenLanguage, screenLanguage: () => screenLanguage, MEDIA_FEATURES, MEDIA_RECONNECT_GRACE_MS, MEDIA_RECONNECT_RETRY_MS, MEDIA_LIVENESS_PROBE_MS, RECOVERY_SEEK_WATCHDOG_MS, effectiveReceiverConfigHash, SCREEN_COPY, SCREEN_SHOWS_PHONE_CHIP, SCREEN_SHOWS_STEPS, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
+  global.ScreenMirrorReceiverCapabilityGate = Object.freeze({ chooseReplySender, playerActive: () => playerActive, SCREEN_TRANSLATIONS, SCREEN_EXTRA_COPY_EN, resolveScreenLanguage, screenLanguage: () => screenLanguage, MEDIA_FEATURES, MEDIA_RECONNECT_GRACE_MS, MEDIA_RECONNECT_RETRY_MS, MEDIA_LIVENESS_PROBE_MS, RECOVERY_SEEK_WATCHDOG_MS, effectiveReceiverConfigHash, SCREEN_COPY, SCREEN_SHOWS_PHONE_CHIP, SCREEN_SHOWS_STEPS, STALL_FULL_SCREEN_AFTER_MS, STALL_GIVE_UP_AFTER_MS, CONNECTED_WITHOUT_START_MS, NO_SENDER_RETURN_TO_HOME_MS, IDLE_RETURN_TO_HOME_STATES, closeScreen, MIME_TYPE, AUDIO_MIME_TYPE, RESULT, validEndpoint, validateProbe, validateMediaStart, validateReadyQuery, makeReadyReport, validateVisibilityQuery, resolveVisibility, makeVisibilityReport, receiverReadinessStateForScreen, recoverySeekTarget, stalledLiveEdgeSeekTarget, bufferedTrimEnd, liveEdgePlaybackRate, readBufferedRanges, createHealthyLiveEdgeCatchup, summarizeFragment, makeLatencyStage, makePeriodicPlaybackSample, canConfirmFirstRendered, shouldShowReconnectingScreen, renderedCorrelationStrategy, createMediaCreditEmitter, createInitialAudioCreditDelivery, createFrameCorrelationTracker, createFramePacingSummary, receiverRevision: RECEIVER_REVISION, receiverStopDiagnostics: Object.freeze(["receiver_stop_received", "receiver_video_cleared", "receiver_idle_screen_shown", "receiver_casting_stopped_screen_shown", "receiver_connection_lost_screen_shown", "receiver_document_pagehide_after_stop"]), capabilityResult: () => capabilityResult(), snapshot: () => ({ ...capabilities }), capabilityDiagnosticResults: () => capabilityDiagnosticResults() });
   if (typeof document !== "undefined") document.readyState === "loading" ? document.addEventListener("DOMContentLoaded", boot, { once: true }) : boot();
 })(globalThis);
