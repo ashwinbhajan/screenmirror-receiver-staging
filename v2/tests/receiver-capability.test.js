@@ -1068,9 +1068,9 @@ test("TV languages: language choice and fallback", () => {
   assert.equal(resolveScreenLanguage(["es-ES"]), "es");
   assert.equal(resolveScreenLanguage(["pt_BR"]), "pt");
   assert.equal(resolveScreenLanguage(["HI-in"]), "hi");
-  assert.equal(resolveScreenLanguage(["ja-JP", "fr-FR"]), "fr", "first supported wins");
+  assert.equal(resolveScreenLanguage(["sw-KE", "fr-FR"]), "fr", "first supported wins");
   assert.equal(resolveScreenLanguage(["en-GB", "de-DE"]), "en", "English before others stays English");
-  assert.equal(resolveScreenLanguage(["ja-JP", 7, null]), "en");
+  assert.equal(resolveScreenLanguage(["sw-KE", 7, null]), "en");
 });
 
 function bootScreens(languages, search = "") {
@@ -1094,7 +1094,7 @@ test("TV languages: a Spanish TV shows Spanish screens, steps and chip", () => {
 });
 
 test("TV languages: an English or unsupported TV is unchanged", () => {
-  for (const languages of [["en-US"], ["ja-JP"], []]) {
+  for (const languages of [["en-US"], ["sw-KE"], []]) {
     const { nodes } = bootScreens(languages);
     assert.equal(nodes["status-title"].textContent, "Connection Lost");
     assert.equal((nodes["status-step-1"] || {}).textContent, undefined, "page text left as written");
@@ -1281,5 +1281,27 @@ test("the waiting screen no longer tells the person to unlock the iPhone (owner:
   assert.doesNotMatch(gate.SCREEN_COPY.stalledLost[1], /Unlock/);
   for (const [lang, copy] of Object.entries(gate.SCREEN_TRANSLATIONS)) {
     assert.ok(copy.stalledLost[1].includes("Wi‑Fi") || copy.stalledLost[1].includes("wifi") || copy.stalledLost[1].includes("WLAN"), lang);
+  }
+});
+
+test("TV languages: 39 languages including Indian, East Asian and right-to-left ones", () => {
+  const gate = receiver();
+  const languages = Object.keys(gate.SCREEN_TRANSLATIONS);
+  assert.equal(languages.length + 1, 39, "38 translations plus English");
+  for (const language of ["ja", "ko", "zh", "zh-hant", "ru", "uk", "vi", "th", "ms", "fil", "sv", "da", "nb", "fi", "cs", "ro", "hu", "el",
+    "mr", "ta", "te", "bn", "gu", "kn", "ml", "ar", "ur", "he"]) assert.ok(languages.includes(language), language);
+  const { resolveScreenLanguage } = gate;
+  assert.equal(resolveScreenLanguage(["zh-TW"]), "zh-hant");
+  assert.equal(resolveScreenLanguage(["zh-Hant-HK"]), "zh-hant");
+  assert.equal(resolveScreenLanguage(["zh-CN"]), "zh");
+  assert.equal(resolveScreenLanguage(["zh-Hans"]), "zh");
+  assert.equal(resolveScreenLanguage(["no-NO"]), "nb");
+  assert.equal(resolveScreenLanguage(["tl-PH"]), "fil");
+  assert.equal(resolveScreenLanguage(["iw-IL"]), "he");
+  assert.equal(resolveScreenLanguage(["mr-IN"]), "mr");
+  assert.deepEqual([...gate.SCREEN_RTL_LANGUAGES], ["ar", "ur", "he"]);
+  // App names inside right-to-left text are isolated so the quotes stay put.
+  for (const language of gate.SCREEN_RTL_LANGUAGES) {
+    assert.match(gate.SCREEN_TRANSLATIONS[language].ready[1], /«⁨Cast to TV⁩»/, language);
   }
 });
