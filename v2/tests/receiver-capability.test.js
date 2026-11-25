@@ -896,9 +896,9 @@ test("audio initial credits can be re-sent once after a reconnect", () => {
 });
 
 // Full TV session with a fake media connection, for Wi-Fi grace scenarios.
-async function wifiGraceSession({ optIn }) {
+async function wifiGraceSession({ optIn, features = ["reconnect"] }) {
   const messages = []; const sources = []; const sockets = []; const buffers = []; const nodes = {}; const classes = new Set();
-  const cleanup = []; const videoEvents = {}; const timers = []; let receiverListener; let nextFrame; let now = 0; const systemEvents = {};
+  const cleanup = []; const videoEvents = {}; const timers = []; const intervals = []; let receiverListener; let nextFrame; let now = 0; const systemEvents = {};
   const schedule = (callback, ms) => { timers.push({ callback, ms }); return timers.length; };
   const cancel = (id) => { if (id) timers[id - 1] = null; };
   const runTimer = (ms) => { const index = timers.findIndex((timer) => timer && timer.ms === ms); assert.ok(index >= 0, `no ${ms} ms timer`); const { callback } = timers[index]; timers[index] = null; callback(); };
@@ -911,8 +911,9 @@ async function wifiGraceSession({ optIn }) {
     addSourceBuffer() { const buffer = { listeners: {}, addEventListener(name, callback) { this.listeners[name] = callback; }, appendBuffer() {} }; buffers.push(buffer); return buffer; }
   }
   class WebSocket { constructor(url) { this.url = url; this.readyState = 1; this.sent = []; sockets.push(this); } send(value) { this.sent.push(JSON.parse(value)); } close() { this.readyState = 3; } }
-  const context = { ArrayBuffer, Uint8Array, DataView, TextEncoder, performance: { now: () => now }, setTimeout: schedule, clearTimeout: cancel, setInterval: () => 1, clearInterval() {}, MediaSource, WebSocket,
-    document: { readyState: "complete", getElementById: (id) => id === "probe-video" ? video : (nodes[id] ||= {}), body: { classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name) } } },
+  const context = { ArrayBuffer, Uint8Array, DataView, TextEncoder, performance: { now: () => now }, setTimeout: schedule, clearTimeout: cancel,
+    setInterval: (callback, ms) => { intervals.push({ callback, ms }); return intervals.length; }, clearInterval(id) { if (id) intervals[id - 1] = null; }, MediaSource, WebSocket,
+    document: { readyState: "complete", getElementById: (id) => id === "probe-video" ? video : (nodes[id] ||= { classList: { add() {}, remove() {}, toggle() {} } }), body: { classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name) } } },
     cast: { framework: { CastReceiverContext: { getInstance: () => ({ addEventListener: (name, callback) => { systemEvents[name] = callback; }, addCustomMessageListener: (_, callback) => { receiverListener = callback; }, start() {}, sendCustomMessage: (_, sender, message) => messages.push({ sender, ...message }) }) }, CastReceiverOptions: function () {}, system: { EventType: { READY: "ready", SENDER_CONNECTED: "sender_connected" }, MessageType: { JSON: "JSON" } } } } };
   context.URL = class extends URL { static createObjectURL() { return "blob:test"; } };
   vm.runInNewContext(fs.readFileSync(receiverSourcePath, "utf8"), context);
@@ -923,7 +924,7 @@ async function wifiGraceSession({ optIn }) {
   await new Promise(setImmediate); sources[1].listeners.sourceopen();
   sockets[0].onopen();
   sockets[0].onmessage({ data: JSON.stringify({ type: "readyForMedia", protocolVersion: 2 }) });
-  if (optIn) sockets[0].onmessage({ data: JSON.stringify({ type: "senderFeatures", protocolVersion: 2, features: ["reconnect"] }) });
+  if (optIn) sockets[0].onmessage({ data: JSON.stringify({ type: "senderFeatures", protocolVersion: 2, features }) });
   // First picture on the TV.
   const box = (name, payload) => { const result = Buffer.alloc(8 + payload.length); result.writeUInt32BE(result.length); result.write(name, 4); payload.copy(result, 8); return result; };
   const mfhd = Buffer.alloc(8); mfhd.writeUInt32BE(1, 4);
@@ -935,7 +936,7 @@ async function wifiGraceSession({ optIn }) {
   nextFrame(30, { mediaTime: 0, presentedFrames: 1 });
   videoEvents.playing();
   const results = () => messages.map((message) => message.result);
-  return { sockets, nodes, cleanup, results, runTimer, endpoint, setNow: (value) => { now = value; } };
+  return { sockets, nodes, cleanup, results, runTimer, endpoint, intervals, setNow: (value) => { now = value; } };
 }
 
 test("Wi-Fi grace: a drop keeps the picture and the same TV reconnects", async () => {
@@ -988,4 +989,42 @@ test("Wi-Fi grace: an iPhone that did not opt in gets the old behaviour", async 
   assert.ok(!session.results().includes("receiver_media_reconnect_started"));
   assert.equal(session.nodes["status-title"].textContent, "Connection Lost");
   assert.equal(session.sockets.length, 1);
+});
+
+test("Wi-Fi grace: a real error after the first picture ends the cast, never reconnects", async () => {
+  const session = await wifiGraceSession({ optIn: true });
+  // An invalid binary message is a protocol error: the TV closes on purpose.
+  session.sockets[0].onmessage({ data: new Uint8Array([1, 2, 3]).buffer });
+  session.sockets[0].onclose({ code: 1005, wasClean: true });
+  assert.ok(!session.results().includes("receiver_media_reconnect_started"));
+  assert.equal(session.nodes["status-title"].textContent, "Connection Lost");
+  assert.equal(session.sockets.length, 1);
+});
+
+test("Wi-Fi grace: a pause from before the drop does not stay on screen", async () => {
+  const session = await wifiGraceSession({ optIn: true });
+  session.sockets[0].onmessage({ data: JSON.stringify({ type: "senderPaused", protocolVersion: 2 }) });
+  assert.equal(session.nodes["stall-badge-text"].textContent, "Paused on your iPhone");
+  session.sockets[0].onclose({ code: 1006 });
+  session.runTimer(1000);
+  session.sockets[1].onopen();
+  session.sockets[1].onmessage({ data: JSON.stringify({ type: "readyForMedia", protocolVersion: 2 }) });
+  assert.equal(session.nodes["stall-badge"].hidden, true, "badge cleared; the iPhone re-sends pause if still paused");
+});
+
+test("Wi-Fi grace: a stuck picture probes the connection so a dead link fails fast", async () => {
+  const session = await wifiGraceSession({ optIn: true, features: ["visibility", "reconnect"] });
+  const probe = session.intervals.find((interval) => interval && interval.ms === 3000);
+  assert.ok(probe, "probe installed for an iPhone that opted in");
+  const sent = () => session.sockets[0].sent.filter((m) => m.type === "receiverVisibility").length;
+  const before = sent();
+  session.setNow(1000); probe.callback();
+  assert.equal(sent(), before, "no probe while the picture is moving");
+  session.setNow(10000); probe.callback();
+  assert.equal(sent(), before + 1, "probe while the picture is stuck");
+});
+
+test("Wi-Fi grace: no probe for an iPhone that did not opt in", async () => {
+  const session = await wifiGraceSession({ optIn: false });
+  assert.ok(!session.intervals.some((interval) => interval && interval.ms === 3000));
 });
